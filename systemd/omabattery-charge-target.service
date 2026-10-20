@@ -1,0 +1,21 @@
+# OmaBattery — re-apply the remembered charge target.
+#
+# install.sh substitutes @PLUGIN_DIR@ with the installed plugin path and copies
+# this to ~/.config/systemd/user/. The unit runs as the desktop user; it can
+# write the thresholds because the OmaBattery udev rule makes them writable.
+#
+# On ThinkPads the embedded controller already stores the thresholds in NVRAM,
+# so this is a no-op there. It exists for hardware whose EC forgets the value
+# across a power cycle, which is what makes the chosen target stick "regardless
+# of reboot" everywhere.
+[Unit]
+Description=Re-apply the saved OmaBattery charge target
+Documentation=https://github.com/thepathless/OmaBattery
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash @PLUGIN_DIR@/scripts/omabattery-set-limit --restore
+
+[Install]
+WantedBy=default.target

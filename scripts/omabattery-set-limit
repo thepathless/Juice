@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# OmaBattery — apply a hardware charge target.
+#
+#   omabattery-set-limit <1-100>   set the target and remember it
+#   omabattery-set-limit --restore re-apply the remembered target (boot unit)
+#
+# Writes the kernel charge threshold attributes directly. Privilege comes from a
+# udev rule installed by install.sh that makes these two attributes writable by
+# the logged-in user, so no sudo, pkexec or polkit helper is involved at
+# runtime. Persistence has two layers:
+#
+#   1. The embedded controller stores the thresholds in NVRAM on ThinkPads, so
+#      they survive a reboot on their own.
+#   2. The chosen target is saved to ~/.local/state/omabattery/charge-target and
+#      re-applied by the omabattery-charge-target user unit at login, which
+#      covers hardware whose EC forgets.
+#
+# Output is tab-separated key/value pairs, matching the panel's parser:
+#   status	ok        target	100     start	0     end	100
+#   status	error     message	<why it failed>
+
+set -euo pipefail
+
+POWER_SUPPLY="${OMABATTERY_POWER_SUPPLY_PATH:-/sys/class/power_supply}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_DIR="$STATE_HOME/omabattery"
+STATE_FILE="$STATE_DIR/charge-target"
+
+fail() {
+  printf 'status\terror\n'
+  printf 'message\t%s\n' "$*"
+  exit 1
+}
+
+battery=""
+for candidate in "$POWER_SUPPLY"/BAT* "$POWER_SUPPLY"/battery; do
+  [[ -d $candidate && -r $candidate/capacity ]] || continue
+  battery="$candidate"
+  break
+done
+[[ -n $battery ]] || fail "No battery found under $POWER_SUPPLY"
+
+end_file=""
+for f in charge_control_end_threshold charge_stop_threshold; do
+  [[ -e $battery/$f ]] || continue
+  end_file="$battery/$f"
+  break
+done
+[[ -n $end_file ]] || fail "This battery does not expose a charge threshold"
+
+start_file=""
+for f in charge_control_start_threshold charge_start_threshold; do
+  [[ -e $battery/$f ]] || continue
+  start_file="$battery/$f"
+  break
+done
+
+mode="set"
+target=""
+case "${1:-}" in
+  -h | --help)
+    printf 'Usage: %s <1-100>|--restore\n' "$(basename "$0")"
+    exit 0
+    ;;
+  --restore)
+    mode="restore"
+    ;;
+  '')
+    fail "Missing charge target (1-100) or --restore"
+    ;;
+  *)
+    target="$1"
+    ;;
+esac
+
+if [[ $mode == "restore" ]]; then
+  # No remembered target yet: leave the hardware exactly as it is.
+  [[ -r $STATE_FILE ]] || exit 0
+  target="$(tr -d '[:space:]' < "$STATE_FILE" 2>/dev/null || true)"
+  [[ $target =~ ^[0-9]+$ ]] || exit 0
+fi
+
+[[ $target =~ ^[0-9]+$ ]] || fail "Charge target must be a whole percentage (1-100)"
+(( target >= 1 && target <= 100 )) || fail "Charge target must be between 1 and 100"
+
+if [[ ! -w $end_file ]]; then
+  fail "Charge threshold is not writable — run install.sh to install the udev rule"
+fi
+if [[ -n $start_file && ! -w $start_file ]]; then
+  fail "Start threshold is not writable — run install.sh to install the udev rule"
+fi
+
+# On thinkpad_acpi a start threshold of 0 means "no lower bound" (kernel ABI:
+# 0 = threshold off), so charging resumes whenever the battery sits below the
+# stop threshold. Writing it before the stop threshold is what makes raising the
+# limit to 100 start charging immediately on an EC currently holding at 80.
+if [[ -n $start_file ]]; then
+  printf '0\n' > "$start_file"
+fi
+printf '%s\n' "$target" > "$end_file"
+
+# Read back what the controller actually accepted instead of assuming the write
+# landed, and report the real values to the panel.
+start_now=""
+[[ -n $start_file ]] && start_now="$(tr -d '[:space:]' < "$start_file" 2>/dev/null || true)"
+end_now="$(tr -d '[:space:]' < "$end_file" 2>/dev/null || true)"
+[[ $end_now == "$target" ]] || fail "Controller kept ${end_now:-an unknown value} instead of $target"
+
+if [[ $mode == "set" ]]; then
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$target" > "$STATE_FILE"
+fi
+
+printf 'status\tok\n'
+printf 'target\t%s\n' "$target"
+printf 'start\t%s\n' "${start_now:-0}"
+printf 'end\t%s\n' "$end_now"
+exit 0

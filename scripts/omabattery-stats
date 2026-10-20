@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# OmaBattery — read-only battery probe.
+#
+# Prints tab-separated key/value pairs consumed by Panel.qml through the same
+# parseKeyValue() helper the stock omarchy.power panel uses. Every value is read
+# straight from sysfs/UPower-adjacent kernel attributes; nothing here writes or
+# assumes state.
+#
+# Keys: path unit capacity status capacity_level energy_now energy_full
+#       energy_full_design voltage_now voltage_min_design power_now current_now
+#       cycle_count technology manufacturer model serial ac_online
+#       threshold_start threshold_end temp_c
+#
+# Optional keys are omitted when the hardware does not expose them.
+
+set -euo pipefail
+
+POWER_SUPPLY="${OMABATTERY_POWER_SUPPLY_PATH:-/sys/class/power_supply}"
+
+# Read a sysfs number with all whitespace stripped.
+num() {
+  [[ -r $1 ]] || return 0
+  tr -d '[:space:]' < "$1" 2>/dev/null || true
+}
+
+# Read a sysfs string, trimming leading/trailing whitespace but keeping the
+# spaces inside values such as "Not charging".
+text() {
+  [[ -r $1 ]] || return 0
+  tr -d '\r\n' < "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
+}
+
+battery=""
+for candidate in "$POWER_SUPPLY"/BAT* "$POWER_SUPPLY"/battery; do
+  [[ -d $candidate && -r $candidate/capacity ]] || continue
+  battery="$candidate"
+  break
+done
+
+# No battery (desktop): print nothing so the panel keeps its last known state.
+[[ -n $battery ]] || exit 0
+
+# energy_* (µWh) and charge_* (µAh) are alternative families; report which one
+# the hardware uses so the panel can pick the right unit.
+unit="Wh"
+energy_now="$(num "$battery/energy_now")"
+energy_full="$(num "$battery/energy_full")"
+energy_full_design="$(num "$battery/energy_full_design")"
+if [[ -z $energy_full ]]; then
+  unit="Ah"
+  energy_now="$(num "$battery/charge_now")"
+  energy_full="$(num "$battery/charge_full")"
+  energy_full_design="$(num "$battery/charge_full_design")"
+fi
+
+# Instantaneous power draw: power_now when present, otherwise current × voltage.
+power_now="$(num "$battery/power_now")"
+current_now="$(num "$battery/current_now")"
+voltage_now="$(num "$battery/voltage_now")"
+if [[ -z $power_now && -n $current_now && -n $voltage_now ]]; then
+  power_now="$(awk -v c="$current_now" -v v="$voltage_now" 'BEGIN { printf "%d", (c * v) / 1000000 }')"
+fi
+
+# Charge thresholds: charge_control_* is the current attribute names, the
+# charge_stop/start_threshold pair is the older ThinkPad naming.
+threshold_end=""
+for f in charge_control_end_threshold charge_stop_threshold; do
+  [[ -r $battery/$f ]] || continue
+  threshold_end="$(num "$battery/$f")"
+  break
+done
+threshold_start=""
+for f in charge_control_start_threshold charge_start_threshold; do
+  [[ -r $battery/$f ]] || continue
+  threshold_start="$(num "$battery/$f")"
+  break
+done
+
+# AC online, by looking for a Mains supply rather than assuming a path.
+ac_online="0"
+for supply in "$POWER_SUPPLY"/*; do
+  [[ -r $supply/type ]] || continue
+  [[ "$(text "$supply/type")" == "Mains" ]] || continue
+  [[ "$(num "$supply/online")" == "1" ]] || continue
+  ac_online="1"
+  break
+done
+
+# Battery temperature: the dedicated temp attribute is in tenths of °C, an
+# hwmon temp*_input is in milli-°C.
+temp_c=""
+if [[ -r $battery/temp ]]; then
+  temp_c="$(awk -v t="$(num "$battery/temp")" 'BEGIN { printf "%.1f", t / 10 }')"
+else
+  for hwmon in "$battery"/hwmon*/temp*_input; do
+    [[ -r $hwmon ]] || continue
+    temp_c="$(awk -v t="$(num "$hwmon")" 'BEGIN { printf "%.1f", t / 1000 }')"
+    break
+  done
+fi
+
+emit() {
+  printf '%s\t%s\n' "$1" "$2"
+}
+
+emit path "$battery"
+emit unit "$unit"
+emit capacity "$(num "$battery/capacity")"
+emit status "$(text "$battery/status")"
+emit capacity_level "$(text "$battery/capacity_level")"
+emit present "$(text "$battery/present")"
+emit energy_now "$energy_now"
+emit energy_full "$energy_full"
+emit energy_full_design "$energy_full_design"
+emit voltage_now "$voltage_now"
+emit voltage_min_design "$(num "$battery/voltage_min_design")"
+emit power_now "$power_now"
+emit current_now "$current_now"
+emit cycle_count "$(num "$battery/cycle_count")"
+emit technology "$(text "$battery/technology")"
+emit manufacturer "$(text "$battery/manufacturer")"
+emit model "$(text "$battery/model_name")"
+emit serial "$(text "$battery/serial_number")"
+emit ac_online "$ac_online"
+emit health "$(text "$battery/health")"
+[[ -n $threshold_start ]] && emit threshold_start "$threshold_start"
+[[ -n $threshold_end ]] && emit threshold_end "$threshold_end"
+[[ -n $temp_c ]] && emit temp_c "$temp_c"
+
+exit 0

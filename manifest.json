@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "thepathless.omabattery",
+  "name": "OmaBattery",
+  "version": "1.1.0",
+  "author": "thepathless",
+  "description": "Bespoke animated battery widget with hardware charge targets (80% / 100%) and compact telemetry dashboard",
+  "license": "MIT",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaBattery",
+    "description": "Hardware charge targets and detailed battery health",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "schema": [
+      {
+        "key": "showPercentage",
+        "type": "boolean",
+        "label": "Show percentage",
+        "description": "Show the battery level next to the bar icon, in the icon's colour.",
+        "defaultValue": false
+      },
+      {
+        "key": "powerSaverThreshold",
+        "type": "integer",
+        "label": "Power saver at",
+        "description": "Engage the power-saver power profile when on battery at or below this percentage.",
+        "min": 5,
+        "max": 95,
+        "step": 5,
+        "defaultValue": 50
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+# OmaBattery — make the battery charge thresholds writable by the desktop user.
+#
+# The kernel exposes charge_control_start_threshold / charge_control_end_threshold
+# as root-only attributes. This rule is the single privilege mechanism OmaBattery
+# uses: it chmods those attributes (and the older charge_start/stop_threshold
+# naming) when the battery appears, so the panel and the login restore unit can
+# write them directly. No sudo, pkexec or polkit helper is involved at runtime.
+#
+# -f ignores the missing attributes on batteries that expose only one naming.
+ACTION=="add|change", SUBSYSTEM=="power_supply", ATTR{type}=="Battery", RUN+="/usr/bin/chmod -f 0666 /sys/class/power_supply/%k/charge_control_start_threshold /sys/class/power_supply/%k/charge_control_end_threshold /sys/class/power_supply/%k/charge_start_threshold /sys/class/power_supply/%k/charge_stop_threshold"

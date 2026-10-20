@@ -1,0 +1,17 @@
+# Agent documentation (local only, do not commit)
+agent.md
+AGENT.md
+
+# Quickshell / QML LSP & compiled bytecode
+/.qmlls.ini
+*.qmlc
+*.jsc
+
+# Freebuff / worker artifacts
+.freebuff/
+
+# Editor backups
+*~
+*.swp
+*.swo
+.DS_Store
