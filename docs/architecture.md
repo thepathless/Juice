@@ -76,7 +76,8 @@ exists — not because the probe failed.
 | `usageInfo`, `usageUnavailable` | `Panel.qml` | report JSON from `juice-usage --report` |
 | `usageDay` (selected bar), app rows/note for it | `Panel.qml` | `""` is today, reset by `collapseSections()`; `UsageCard` emits `daySelected(date)` |
 | Detail tab index, keyboard profile cursor, option settings | `Panel.qml` | tab selection; the six OPTIONS values persist through the widget's inline `shell.json` entry |
-| Metered history (35 days) | `scripts/juice-usage` | `~/.local/state/juice/usage.json`; the only persisted state |
+| Metered history (35 days) | `scripts/juice-usage` | `~/.local/state/juice/usage.json` |
+| Saved charge target | `scripts/juice-set-limit` | `~/.local/state/juice/charge-target`, restored by the user unit |
 | Everything else | nobody | `juice-devices` and `Model.js` are stateless |
 
 Components carry no probes, timers or persistence. Their only local state is
@@ -106,6 +107,22 @@ power source; the app list merges today's battery rows with today's activity
 rows (activity first on AC), and each row carries the `basis` text naming its
 window. `appsNote` is empty when rows exist and carries the empty-state message
 when nothing was measured.
+
+## Probe contracts and cadence
+
+| Probe | Contract | Cadence |
+| --- | --- | --- |
+| `juice-stats` | Tab-separated `key\tvalue`; optional sysfs attributes are omitted, not zeroed. Read capped at 4 KiB. | Once at startup, on open, and after a coalesced udev event (2 s). |
+| `juice-devices` | JSON array. Missing levels are `-1`; `parseDevices` returns `null` on malformed input so the last good list stays on screen. | Once at startup and every 15 s while open. |
+| `juice-usage` | Report JSON with `today`, `comparison`, `daily[7]` (each with 24 `hours` and its `apps`), `hours`, `apps`, and `appsNote`. State lives in `usage.json`. | 60 s sampler; 15-minute max gap; 35-day retention; 40-app cap. |
+| `juice-set-limit` | Tab-separated `status`, `target`, `start`, `end` on success; `status`, `message` on failure. Always read back from sysfs. | On button or IPC call, followed by three verification refreshes at 1.5 s. |
+
+The panel refreshes battery and profiles every 5 s, phrases every 2.8 s, devices
+every 15 s, and usage every 60 s while open. The usage daemon runs for the
+shell's lifetime. The `IpcHandler` exposes `open`, `close`, `show`, `hide`,
+`toggle`, `togglePercentage`, `setShowPercentage`, `setRedThreshold`,
+`setPowerSaverThreshold`, `state`, `charge80`, `charge100`, `devices`, `usage`,
+and `card`.
 
 ## Rules for later passes
 

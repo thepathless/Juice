@@ -1,328 +1,360 @@
 # Juice
 
-Battery bar widget and compact dashboard panel for [Omarchy](https://omarchy.org):
+**Battery, charge limits, and usage — in the Omarchy bar.**
 
-1. **Bespoke Vector Battery** — a custom QML battery component (`BatteryIcon.qml`) drawn to iOS's own proportions: a filled capsule with the percentage punched through the fill, the real SF Symbols bolt path while charging, an outlined glyph when the percentage is hidden, and iOS 27's stroke-free capsule when the borderless option is on.
-2. **Fixed, Read-At-A-Glance Panel** — a 338 px card in the Omarchy aesthetic. One permanent hero (level, state, time left, live wattage) is followed by three permanent sections — charge target, power profile and session actions — then five disclosures: battery detail, connected devices, battery usage, usage by app and options. The live controls are always visible; the disclosures start closed (the data sections carry their most useful number) and every open starts on the closed, today view.
-3. **Hardware Charge Targets** — `80% Limit` and `100% Full` write the kernel charge threshold directly via sysfs, so a laptop holding at a conservation limit resumes charging instantly.
-4. **Rich Hardware Telemetry** — live health %, cycles, energy flow, temperature, voltage, and cell chemistry straight from `/sys/class/power_supply/`.
-5. **Smart Automation & Escalation** — Apple's colour semantics (green while charging or full, yellow while Low Power Mode is active, urgent red at or below a configurable threshold), and automatic power-saver profile engagement with a configurable threshold and an on/off switch.
-6. **Connected Devices** — every connected peripheral the system reports: Bluetooth headsets, mice and keyboards, 2.4 GHz dongles and gamepads, each with its battery level where the hardware exposes one. Tap a device and it drops down to the full picture — health, cycles, chemistry, temperature, warning level, Bluetooth address and class, pairing state, USB bus, UPower node and when it last reported. The laptop's own pack is deliberately not one of them: the hero carries its level and BATTERY DETAIL carries its health, so it is never printed a third time.
-7. **Battery Usage, the iOS way** — the Daily Usage card: a seven-day bar chart of pack used per day with today in blue, the "similar amount of battery as usual by 11:06" comparison, the hour-by-hour level chart with green/yellow/red bars and a bolt on charging hours, Screen On / Screen Off totals, and a per-app usage breakdown — all metered from this machine, never estimated placeholder numbers. Tap a bar and the card opens that day: its own curve, percentage, measured energy and Screen On/Off totals, a sentence naming how many hours were observed when the day is only partly measured, `App breakdown wasn't recorded for this day` when that day has no app rows, and a `‹ Today` chip back to the live view. A day with no measurement at all is never 0%: it shows an empty grid, an em dash for the percentage and `No measurements were recorded for this day`.
-8. **Session Actions on a Hold** — Lock, Sleep, Hibernate, Reboot and Shut down sit in one strip, using Omarchy's own glyphs and session commands. Hold the letter shown on a tile for three seconds (or hold the tile with the mouse) to run it; the tile fills and counts down, and releasing early always cancels. `Super+Alt+B` opens the panel when you add the binding below. Session letters are plain keys inside the focused panel — Omarchy's `Super+L` layout cycle and `Super+S` scratchpad are untouched.
+Juice is a bar widget and compact panel for [Omarchy](https://omarchy.org).
+It draws the battery as a real iOS-style glyph, puts the useful controls one
+click away, and measures what the machine actually reports instead of filling
+gaps with plausible numbers.
 
-## The panel
+![Juice in the Omarchy bar and its panel](preview.png)
 
-The hero is permanent. So are **CHARGE TARGET** (`Limit 80%` or
-`Unsupported`), **POWER PROFILE** (`Balanced`, `Saver` or `Performance`) and
-**SESSION**: no chevron, no click needed. The four data sections and **OPTIONS**
-are closed when the panel opens; the data sections carry a summary:
+## What it does
 
-| Section | Behaviour |
-| --- | --- |
-| CHARGE TARGET | Permanent: threshold buttons and the live charging sentence |
-| POWER PROFILE | Permanent: Saver / Balanced / Perf |
-| SESSION | Permanent: the five three-second hold actions below |
-| BATTERY DETAIL | Collapsible; closed summary `85% health` |
-| CONNECTED DEVICES | Collapsible; closed summary `4 devices`, or `None` |
-| BATTERY USAGE | Collapsible; `39% today`, or `21 Oct · 88%` while a past day is open |
-| USAGE BY APP | Collapsible; `3 apps`, or `Not recorded` on a past day with no app rows; hidden when there is nothing to show |
-| OPTIONS | Collapsible; the six widget settings |
-
-The disclosures open independently; tapping a header again closes it, and the
-card scrolls when the open bodies are taller than the space under the bar.
-Opening the panel resets those five rows, the device drop-down and the usage
-day, so it always starts closed on today.
-
-## Session actions
-
-Open Juice with `Super+Alt+B` after adding the binding (see
-[Usage](#usage)). The tiles show a letter and a number; hold either for **three
-seconds** to run the action. The tile fills, counts down, and resets the moment
-you release early. The mouse uses the same gesture: press and hold a tile.
-
-| Action | Glyph | Hold | Number |
-| --- | --- | --- | --- |
-| Lock | `` | `L` | `1` |
-| Sleep | `󰒲` | `Z` | `2` |
-| Hibernate | `󰤁` | `H` | `3` |
-| Reboot | `󰜉` | `R` | `4` |
-| Shut down | `󰐥` | `S` | `5` |
-
-Sleep and Hibernate are omitted when this machine cannot enter them, matching
-Omarchy's own menu rules. A short tap of `H` or `L` still moves the power
-profile cursor; holding past 180 ms turns it into the session hold. `Esc`
-closes the panel. The session letters are handled only while the panel has
-keyboard focus, so `Super+L` still cycles the workspace layout and `Super+S`
-still toggles the scratchpad.
-
-## Screenshots
-
-Every pixel below is either a 1:1 capture of the running shell or the QML itself rendered at the size shown — nothing is upscaled.
-
-### In the bar
-
-![Juice in the real status bar at 1:1, with the plugged and charging glyphs rendered at 52 px](docs/screenshots/bar.png)
-
-### The panel
-
-![Juice as it opens: the hero, the permanent controls, then the closed disclosures carrying their own numbers](docs/screenshots/panel-minimal.png)
-
-![BATTERY DETAIL expanded on HEALTH: maximum capacity, condition, wear, cycle count, kernel health and capacity level](docs/screenshots/panel-battery-detail.png)
-
-![CONNECTED DEVICES expanded with one device's drop-down open: level, connection, kind, USB bus and sysfs path](docs/screenshots/panel-device-open.png)
-
-![BATTERY USAGE expanded: the comparison sentence, the seven-day chart, the hourly level and Screen On / Off totals](docs/screenshots/panel-battery-usage.png)
-
-![A tapped day: 21 Oct opened from the chart, with its own curve, its 9 measured hours named, 88% used, 33.6 Wh and a chip back to Today](docs/screenshots/panel-battery-day.png)
-
-Every other section has its own plate beside these: `panel-charge-target.png`,
-`panel-power-profile.png`, `panel-usage-by-app.png` and `panel-options.png`.
-
-### Glyph and references
-
-![Battery glyph rendered at 64 px at 25, 50, 75 and 100 percent, then charging at 81 percent](docs/screenshots/glyph-states.png)
-
-![Four SF Symbols battery glyphs beside the Juice glyphs at the same 64 px body height](docs/screenshots/icon-vs-sfsymbols.png)
-
-![The UIKit-derived detail card beside the live card, both at 1:1](docs/screenshots/card-vs-reference.png)
-
-## Features
-
-- **Percentage inside the icon**: the digits are a knockout in the fill, exactly as iOS 16+ renders them, and never shrink the icon.
-- **Live Fluid Fill**: Liquid level changes transition smoothly with cubic easing.
-- **Steady Charging Readout**: the digits and the bolt stay fully opaque and static while current flows in, so the bar never flickers or pulses.
-- **ThinkPad & Modern Laptop Longevity**: Native support for `charge_control_end_threshold`.
-
+- **A real glyph** — four honest states, a clipped vector fill, digits cut out
+  of the level, optional percentage inside, and an iOS 27 borderless body.
+- **A focused panel** — one permanent hero, three permanent controls, and five
+  disclosures that start closed and open only when needed.
+- **Hardware charge targets** — 80/100 write the controller threshold, read it
+  back, and persist it across reboots where the hardware forgets.
+- **Measured data** — health, connected batteries, and seven-day usage from the
+  system. Missing values stay missing; nothing is invented.
 
 ## Requirements
 
-- Omarchy with the Quickshell shell (bar widget plugin support)
-- A battery that exposes `charge_control_end_threshold` / `charge_stop_threshold`
-  for the charge-target buttons (ThinkPads, and most modern laptops). The health
-  section works on any battery.
-- `jq` for the installer
-- `python3` for battery-usage metering (the card hides its numbers and says so
-  when it is missing; every other section keeps working)
+| Requirement | Why |
+| --- | --- |
+| Omarchy Quattro with the Quickshell bar | The widget is a `bar-widget` plugin |
+| A battery exposed by UPower | Without one, Juice hides itself |
+| `jq` | The installer and the connected-device probe |
+| `python3` | Battery usage metering; the rest of the panel works without it |
+| `upower`, `bluetoothctl`, `udevadm` | Device levels, Bluetooth facts, and USB receivers |
+| `hyprctl` | Screen On/Off and focused-window time |
+| `powerprofilesctl` and Omarchy's profile commands | Power profile controls |
+| `systemd --user` | Re-applies the saved charge target at login |
+| A battery exposing `charge_control_end_threshold` or `charge_stop_threshold` | Enables the 80/100 controls; health and usage still work without it |
+
+The installer needs root **once** for the udev rule described in
+[System changes and removal](#system-changes-and-removal). There is no root
+helper in the runtime path.
 
 ## Install
 
-```bash
-omarchy plugin add https://github.com/thepathless/Juice.git
+```sh
+omarchy plugin add https://github.com/thepathless/Juice.git --enable
 ~/.config/omarchy/plugins/thepathless.juice/install.sh
 ```
 
-Or from a local checkout:
+The first command clones and enables the plugin. The second is the one-time
+setup: it installs the user unit that restores the charge target, adds the udev
+rule that makes the threshold attributes writable, and enables Juice in the
+right section. It may ask for your password once for the udev rule.
 
-```bash
-cd Juice
-./install.sh
-```
+From a local checkout, run `./install.sh`. Use `install.sh --no-enable` to skip
+adding it to the bar. If your battery has no charge threshold, the installer is
+only needed for the charge-target controls; the glyph, health, devices, and
+usage work without it.
 
-`install.sh` is idempotent and does four things:
+## The bar
 
-| Step | What it does | Privilege |
-| --- | --- | --- |
-| validate | runs `omarchy plugin validate` on the manifest | user |
-| place | links/copies the plugin into `~/.config/omarchy/plugins/thepathless.juice` | user |
-| restore unit | installs and enables `juice-charge-target.service` (user unit) | user |
-| udev rule | installs `99-juice-charge-thresholds.rules` so the thresholds are writable | root (skipped when already writable) |
+![Juice in the real status bar at 1:1, with the plugged and charging glyphs](docs/screenshots/bar.png)
 
-Finally it enables the widget in the right bar section.
+- **Left-click** opens or closes the panel.
+- **Right-click** toggles the percentage inside the battery.
+- Hovering shows the state, level when the glyph hides it, and an explanation
+  when the controller is holding at a charge limit.
 
-## How the charge targets work
-
-Two layers, no privilege helper at runtime:
-
-- **Privilege** — `udev/99-juice-charge-thresholds.rules` chmods
-  `charge_control_start_threshold` / `charge_control_end_threshold` (and the
-  older `charge_start_threshold` / `charge_stop_threshold` naming) to `0666` when
-  the battery appears. The panel then writes the value directly; there is no
-  `pkexec`, polkit policy or root-owned helper in the code path.
-- **Persistence** — ThinkPad-class embedded controllers store the thresholds in
-  NVRAM, so they already survive a reboot. For hardware that forgets, the
-  chosen target is saved to `$XDG_STATE_HOME/juice/charge-target` and
-  re-applied by the user unit at login.
-
-Selecting a target writes start `0` (kernel ABI: `0` = no lower bound, i.e.
-"threshold off") followed by the stop threshold. Setting the stop threshold back
-to `100` is what un-clamps a machine currently holding at 80 — charging resumes
-immediately, no reboot and no unplugging needed.
-
-The panel never assumes the write landed: `scripts/juice-set-limit` reads
-both attributes back from the controller, reports them, and the section shows
-what the hardware actually holds along with its live charging state.
-
-## Bar icon and options
-
-The bar glyph comes from bindings on UPower plus a power-supply uevent monitor
-(`udevadm monitor --subsystem-match=power_supply`), so it flips the moment the
-hardware does instead of on a timer:
+The glyph is one component, `BatteryIcon.qml`, drawn from Apple's own
+proportions. The digits are part of the fill: when a digit straddles the level
+edge, the part over the empty track takes the bar's ink and the part over the
+fill becomes a hole. Charging keeps the digits solid and steady instead of
+pulsing.
 
 | State | Glyph | When |
 | --- | --- | --- |
-| Charging | filled to the level, bolt beside the digits (or centred when the percentage is hidden) | current is flowing in |
-| Plugged in, not charging | filled to the level, no bolt | on AC, holding at a charge limit |
-| Full | full body, no bolt | at 100% |
-| Discharging | filled to the level; digits knocked out of the fill when the percentage is shown | running on battery |
+| Charging | Filled to level, bolt beside the digits or centred | Current is flowing in |
+| Plugged in | Filled to level, no bolt | On AC, holding at a limit |
+| Full | Full body, no bolt | At 100% |
+| Discharging | Filled to level, digits in the fill | The battery is the source |
 
-Colour follows the state's precedence: **green** while charging or full — even
-below the red threshold or in Low Power Mode — then **yellow** while the
-`power-saver` profile is active, **red** at or below the configurable threshold
-(20% by default), otherwise the bar's own foreground.
+Colour follows the state's precedence: green while charging or full, then
+yellow while the `power-saver` profile is active, then red at or below the
+configurable threshold, otherwise the bar's own foreground. The threshold is
+inclusive: at the default 20%, 20% is already red.
 
-The charge limit is the state machine's only boundary: on AC the bar reports
-**charging** until the pack reaches `limit - 1`, then **plugged** for as long as
-the limit holds; off AC it reports **discharging** regardless of the limit. The
-boundary is computed from the local level and limit, so it never waits for
-UPower's next poll.
+The bar is bound to UPower; a `power_supply` udev monitor refreshes the hardware
+figures when the controller changes, so it does not wait for a timer. The glyph
+also rotates on a vertical bar.
 
-All six options live in the panel's **OPTIONS** section and are stored in this
-widget's inline `shell.json` entry — the mechanism every Omarchy bar setting uses
-— so they survive a restart:
+| Glyph states | Against SF Symbols |
+| --- | --- |
+| ![Battery at 25, 50, 75 and 100 percent, plus charging at 81](docs/screenshots/glyph-states.png) | ![Juice glyphs beside SF Symbols at the same height](docs/screenshots/icon-vs-sfsymbols.png) |
+
+## The panel
+
+![Juice as it opens: the hero, the permanent controls, then the closed disclosures](docs/screenshots/panel-minimal.png)
+
+The card is 338 px wide at the default UI scale and scrolls when an open
+disclosure makes it taller than the space under the bar. Opening it resets all
+five disclosures, the device drop-down, and the selected usage day.
+
+The hero is permanent: level, rotating status line, time remaining, live
+wattage (or `AC` / `BAT` when the hardware reports no rate), and a level bar.
+So are the first three rows below; the other five disclose, each carrying a
+useful number while closed.
+
+| Section | Closed summary | What it shows |
+| --- | --- | --- |
+| **CHARGE TARGET** | `Limit 80%` | 80/100 buttons and the live controller sentence |
+| **POWER PROFILE** | `Balanced` | Saver, Balanced, Performance |
+| **SESSION** | — | Lock, Sleep, Hibernate, Reboot, Shut down |
+| **BATTERY DETAIL** | `84% health` | Health, power, and hardware tabs |
+| **CONNECTED DEVICES** | `2 devices` | Device levels and grouped facts |
+| **BATTERY USAGE** | `39% today` | Seven-day and hourly charts |
+| **USAGE BY APP** | `3 apps` | Per-app shares and focus time |
+| **OPTIONS** | — | Six widget settings |
+
+Every disclosure opens independently; tapping its header again closes it.
+
+### Charge target
+
+![CHARGE TARGET with the 80% and 100% buttons and the live charging sentence](docs/screenshots/panel-charge-target.png)
+
+`80% Limit` sets the stop threshold to 80. `100% Full` writes 100, which
+releases a machine that is currently holding at a lower limit, so charging
+resumes without a reboot or an unplug.
+
+The writer, `scripts/juice-set-limit`, first writes `0` to the start threshold
+(the kernel's "no lower bound"), then writes the stop threshold, then reads both
+back. Juice displays the read-back values, not the request. If the controller
+keeps a different value, the panel says so and the target is not saved.
+
+The saved target lives in `$XDG_STATE_HOME/juice/charge-target` and is re-applied
+by `juice-charge-target.service` at login. ThinkPad-class controllers already
+store the thresholds in NVRAM, so the unit is a no-op there; it exists for
+hardware that forgets.
+
+### Power profile
+
+![POWER PROFILE with Saver, Balanced and Perf](docs/screenshots/panel-power-profile.png)
+
+Clicking a profile applies it through Omarchy's per-power-source command, so
+the choice is remembered for AC and battery separately.
+
+**Auto power-saver** is a separate switch, on by default. Juice switches to
+`power-saver` at or below the configured level while on battery, then releases
+at three points above that level or when AC returns. The hysteresis stops a
+battery hovering at the boundary from flapping between profiles. Turning the
+switch off releases a profile the automation engaged and restores the one that
+preceded it.
+
+### Session
+
+Lock, Sleep, Hibernate, Reboot, and Shut down are one strip. Press and hold a
+tile — or hold its letter or number — for **three seconds**. The tile fills and
+counts down; releasing early cancels, and nothing runs from the background.
+
+| Action | Letter | Number |
+| --- | --- | --- |
+| Lock | `L` | `1` |
+| Sleep | `Z` | `2` |
+| Hibernate | `H` | `3` |
+| Reboot | `R` | `4` |
+| Shut down | `S` | `5` |
+
+Sleep and Hibernate disappear when this machine cannot enter them, matching
+Omarchy's own menu rules. The numbers follow the rows that are actually shown.
+
+`L` and `H` also mean left and right for the power-profile cursor. A short tap
+first activates that cursor; the next short tap moves it. Holding either past
+180 ms becomes the session hold. The letters are claimed only while the panel
+has keyboard focus, so `Super+L` and `Super+S` keep their Omarchy meanings.
+
+`Esc` closes the panel. `Tab` / `Shift+Tab` move between panels. Arrow keys and
+`h`/`j`/`k`/`l` activate and move the profile cursor; `Enter` or `Space` applies
+the selected profile.
+
+### Battery detail
+
+![BATTERY DETAIL expanded on HEALTH](docs/screenshots/panel-battery-detail.png)
+
+Three tabs, six rows each. The tab resets to HEALTH when the panel is reopened.
+
+| Tab | Rows |
+| --- | --- |
+| **HEALTH** | Maximum capacity · Condition · Wear · Cycle count · Kernel health · Capacity level |
+| **POWER** | Energy now · Charge rate · Current · Voltage · Temperature · Time left |
+| **SPECS** | Vendor / model · Cell type · Serial · Design capacity · Charge threshold · sysfs path |
+
+### Connected devices
+
+![CONNECTED DEVICES with one device's drop-down open](docs/screenshots/panel-device-open.png)
+
+Juice lists the battery devices the system actually reports: Bluetooth
+headsets, mice, keyboards, touchpads, gamepads, phones, UPSes, and 2.4 GHz
+receivers. The laptop's own pack is deliberately absent; the hero and BATTERY
+DETAIL already carry it.
+
+A row shows the device name, `connection · kind`, and the level. A device whose
+hardware exposes no battery channel is kept as **`Not reported`** — never 0%,
+and never dropped. Tapping it opens only the groups that have something to say:
+
+| Group | Rows |
+| --- | --- |
+| **BATTERY** | Level · State · Health · Cycles · Technology · Temperature · Warning level · Time to empty/full · Rechargeable · Last report |
+| **ENERGY** | Energy · Full charge · Design capacity · Reported rate · Voltage |
+| **CONNECTION** | Connection · Kind · Bluetooth address · Class · Signal · Paired · Trusted · Modalias · USB bus |
+| **DEVICE** | Vendor · Model · Serial |
+| **SYSTEM** | UPower node · sysfs path · History recorded |
+
+The list refreshes every 15 seconds while the panel is open, and once at
+startup. An empty list says `No battery-powered devices are connected`.
+
+### Battery usage
+
+![BATTERY USAGE expanded: the comparison, seven-day chart, hourly level and Screen On/Off](docs/screenshots/panel-battery-usage.png)
+
+The card follows iOS's Daily Usage shape:
+
+- a seven-day chart with a dim **All Day** bar and a brighter **Daily by
+  HH:MM** bar for today;
+- the “similar amount of battery as usual by 11:06” comparison, built only from
+  measured days;
+- an hour-by-hour level chart: green at 50% or above, yellow from 20–49%, red
+  below 20%, with a bolt above charging hours;
+- **Screen On** and **Screen Off** totals.
+
+Tapping a bar opens that day. The selected day gets its own percentage, date,
+measured energy, curve, and totals; a ring marks its bar and `‹ Today` returns
+to the live view.
+
+![A past day opened from the chart](docs/screenshots/panel-battery-day.png)
+
+The card is explicit about missing data. A measured day with holes says how many
+hours were observed before quoting a percentage. A day with no measurement is an
+empty grid with `—` and `No measurements were recorded for this day`, never
+`0%`. A measured day with no app rows says so underneath.
+
+Usage is metered by `scripts/juice-usage`, which runs with the shell and keeps
+35 days in `~/.local/state/juice/usage.json`. It samples every 60 seconds,
+ignores gaps longer than 15 minutes (suspend, shell restart), backfills the week
+from UPower's recorded history, and uses Hyprland's DPMS state for Screen
+On/Off. During discharge, an app's share is its portion of measured CPU work;
+display, idle, and kernel work stay in the day total instead of being pinned on
+an app.
+
+### Usage by app
+
+![USAGE BY APP with rows and basis labels](docs/screenshots/panel-usage-by-app.png)
+
+Up to eight rows, ordered by share. Every row names what its percentage means:
+`of battery used today` or `of CPU activity today`. Focus time is shown only
+when a window actually held focus; otherwise the row prints `—`. A past day
+with no app rows says `App breakdown wasn't recorded for this day`.
+
+CPU activity and focus time are sampled even while charging, so a brief
+discharge cannot hide the charging session. A day with no battery measurement
+falls back to the last discharge; with none at all, the section says that
+nothing was measured rather than showing zeroes.
+
+### Options
+
+![OPTIONS with all six settings](docs/screenshots/panel-options.png)
 
 | Option | Default | Range | Effect |
-| --- | --- | --- | --- |
-| Percentage inside battery | off | on / off | Level inside the body, punched out of the fill (also on right-click) |
-| iOS 27 borderless body | off | on / off | Filled capsule with no outline: the body carries the track and the fill runs flush to its edge, instead of the bordered iOS 16–26 glyph |
-| Icon height | 13 px | 11–18, step 1 | Body height of the bar glyph, in the shell's spacing units, so it follows the shell's UI scale. The digits scale with it and never shrink the icon |
-| Turn red at or below | 20% | 5–50%, step 5 | Level at which the glyph switches to Apple's red; the threshold is inclusive, so 20% is already red |
-| Auto power-saver | on | on / off | Switch the automatic profile change off. Turning it off releases a profile it engaged and restores the one that was active before |
-| Power saver at | 50% | 5–95%, step 5 | On battery at or below this level, switch to the `power-saver` profile; release at +3% so it cannot flap. Inactive while Auto power-saver is off |
+| --- | ---: | --- | --- |
+| Percentage inside battery | off | on/off | Digits inside the body; also right-click |
+| iOS 27 borderless body | off | on/off | Stroke-free capsule instead of the outlined glyph |
+| Icon height | 13 px | 11–18, step 1 | Body height in the shell's spacing units |
+| Turn red below | 20% | 5–50, step 5 | Inclusive red threshold |
+| Auto power-saver | on | on/off | Enables both engagement and release |
+| Auto power-saver at | 50% | 5–95, step 5 | On-battery engagement level; disabled while auto is off |
 
-The two silhouettes differ in more than the outline. Both draw their body from
-one geometry table, but the bordered glyph is Apple's SF Symbols shape
-(1.947 H wide, 0.330 H corner, 0.135 H stroke, level inset 0.181 H, 0.401 H
-terminal) while the borderless one is the reference widget's iOS 27 body
-(1.829 H wide with the digits and 1.923 H without, one 12 px corner, no stroke,
-a 15 px terminal). Switching the percentage on drops the stroke and the inset
-in both styles, so the digits sit in the fill.
+All six live in this widget's inline `~/.config/omarchy/shell.json` entry, the
+same place every Omarchy bar setting lives, so they survive a restart. The
+number fields accept direct entry, clamp to the manifest range, commit on
+Return or blur, and cancel on Escape.
 
-`state` reports every option as it is actually applied, next to the live level,
-state and colour, so the bar can be checked without reading `shell.json`:
+## How it reads the machine
 
-```bash
-omarchy-shell thepathless.juice setShowPercentage true
-omarchy-shell thepathless.juice setPowerSaverThreshold 50
-omarchy-shell thepathless.juice state    # level, state, icon, colour, borderless, iconSize, redBelow, …
-```
-
-> **Deliberate deviation from the reference:** at 100% the reference widget
-> paints the terminal in the track colour, so a full pill fades into a uniform
-> grey. This widget keeps the state colour there (green while full), so the
-> whole pill reads as one solid shape. The rule is a single line — `poleColor`
-> in `BatteryIcon.qml` — if you prefer the reference's behaviour.
-
-## Command line / IPC
-
-```bash
-omarchy-shell thepathless.juice charge100
-omarchy-shell thepathless.juice charge80
-omarchy-shell thepathless.juice devices   # JSON: every battery device and its details
-omarchy-shell thepathless.juice usage     # JSON: today, seven-day series, apps
-bash ~/.config/omarchy/plugins/thepathless.juice/scripts/juice-set-limit 100
-bash ~/.config/omarchy/plugins/thepathless.juice/scripts/juice-stats
-bash ~/.config/omarchy/plugins/thepathless.juice/scripts/juice-devices
-python3 ~/.config/omarchy/plugins/thepathless.juice/scripts/juice-usage --report
-```
-
-## Connected devices and battery usage
-
-Both surfaces are read-only and grounded in system sources — nothing is
-fabricated when the hardware stays silent. Every connected Bluetooth device is
-listed, and so is a USB receiver whose HID nodes report a wireless claim, even
-when that hardware exposes no battery channel; those rows say `Not reported`
-rather than showing 0% or disappearing. That is a hardware limit, not a
-detection gap: the device has no battery node to read — for a 2.4 GHz receiver,
-neither a `power_supply` node nor a `hidpp_battery` device exists — so there is
-nothing to report.
-
-A USB dongle is recognised by what its HID nodes call themselves — `HID_NAME`
-and input device names — not by the USB product string, so a receiver that
-enumerates as `USB Composite Device` is still listed. Hubs, the AC adapter and
-USB-C source nodes are not listed.
-
-A section and a device share one gesture and nothing else: the section header
-opens the section, the row inside it opens that one device. Both are closed on
-every panel open, as is the usage day, and the headers summarise what is behind
-them (`Limit 80%`, `Balanced`, `85% health`, `4 devices`, `39% today` or
-`21 Oct · 88%`, `3 apps`).
-
-| Surface | Source |
+| Source | Feeds |
 | --- | --- |
-| Device list, levels, health | `upower -d`, connected `bluetoothctl` devices, and USB HID receivers; a peripheral whose hardware exposes no level is still listed as `Not reported` |
-| Bluetooth facts | `bluetoothctl info` — address, class, icon, pairing, RSSI, modalias |
-| USB / dongle facts | sysfs USB HID interfaces, input names (`… Mouse`, `… Keyboard`), `udevadm`'s `ID_BUS`/vendor database |
-| Energy used per day | `/sys/class/power_supply/BAT*/energy_now`, only while discharging |
-| Level timeline | the sampler, backfilled on first sight from UPower's `GetHistory` |
-| Screen On / Off | Hyprland monitor DPMS state (`hyprctl monitors`) |
-| Per-app rows | `/proc/<pid>/stat` CPU ticks attributed through the process tree to the window class that owns it, plus focused-window seconds |
+| UPower's display device and `omarchy-battery-status` | Level, state, time remaining, hero |
+| `scripts/juice-stats` | Health, energy, thresholds, temperature, AC |
+| `scripts/juice-devices` | UPower, BlueZ, and USB HID battery devices |
+| `scripts/juice-usage` | Energy, level history, DPMS, CPU work, focus time |
+| `udevadm monitor --subsystem-match=power_supply` | Immediate sysfs refresh after a hardware change |
 
-Usage is metered by a sampler that runs with the shell and keeps a 35-day
-history in `~/.local/state/juice/usage.json`. During discharge an app's share of
-the pack is its portion of the CPU work measured in that interval; display,
-idle and kernel work stay in the day total instead of being pinned on an app.
-Gaps longer than 15 minutes (suspend, shell restart) are never attributed to
-anyone.
+The panel refreshes battery and profiles every 5 seconds while open, connected
+devices every 15 seconds, and usage every 60 seconds. The usage sampler runs
+continuously. The detailed JSON contracts, process cadence, and state ownership
+are in [docs/architecture.md](docs/architecture.md).
 
-CPU work and focused-window time are sampled even while charging. The app list
-then shows today's activity shares beside any battery shares measured earlier in
-the day, with activity leading on AC; every row states whether its percentage is
-"of battery used today" or "of CPU activity today" so a brief discharge can
-never hide the charging session. A day with no measurement falls back to the
-last measured discharge, and with none at all the section says that nothing was
-measured rather than showing zeroes. Focus time is shown only when a window was
-actually focused; otherwise the row prints an em dash.
+Juice does not estimate a missing level, turn an unmeasured day into zero, or
+attribute idle and display work to an application.
 
-The week's bars are backfilled once from UPower's recorded history, so the card
-is populated from the first launch rather than after a week of watching. Days
-with no recorded discharge render as empty tracks — there is no made-up number
-behind them.
+## System changes and removal
 
-## Uninstall
+The only privileged setup is the udev rule. It sets mode `0666` on these
+power-supply attributes, and nothing else:
 
-```bash
+```text
+/sys/class/power_supply/BAT*/charge_control_{start,end}_threshold
+/sys/class/power_supply/BAT*/charge_{start,stop}_threshold
+```
+
+The rule is installed once by `install.sh`; after that the panel writes the
+thresholds directly. There is no `pkexec`, polkit policy, or root-owned helper
+in the runtime path. The installer also adds a **user** systemd unit that
+re-applies the saved target at login.
+
+```sh
 ~/.config/omarchy/plugins/thepathless.juice/uninstall.sh
 # or, for a git-managed checkout:
 omarchy plugin remove thepathless.juice
+# keep the udev rule:
+./uninstall.sh --keep-udev
 ```
 
-`uninstall.sh` disables the widget, removes the user unit and the udev rule and
-deletes the symlink when it points at this checkout. It leaves the battery's
-current hardware threshold and the saved target file alone.
+Removal disables the widget, removes the user unit, removes the plugin symlink
+when it points at this checkout, and removes the udev rule unless you ask to
+keep it. It leaves the battery's current hardware threshold and the saved target
+file alone.
 
-## Layout
+Community plugins run unsandboxed inside the long-lived Omarchy shell, so review
+the source before enabling it, just as you would any bar plugin.
 
+## Control
+
+```sh
+omarchy-shell thepathless.juice state       # level, state, colour, options
+omarchy-shell thepathless.juice charge80
+omarchy-shell thepathless.juice charge100
+omarchy-shell thepathless.juice devices     # JSON
+omarchy-shell thepathless.juice usage       # JSON
 ```
-Juice/
-├── manifest.json                               plugin manifest (schemaVersion 1)
-├── Panel.qml                                   bar widget, panel shell, state and IPC
-├── BatteryIcon.qml                             vector battery glyph
-├── ConnectedDevices.qml                        connected-device list and dropdown
-├── SectionCard.qml                             collapsible section header and body
-├── UsageCard.qml                               iOS Daily Usage card and charts
-├── UsageAppList.qml                            per-app battery usage rows
-├── DetailRow.qml                               shared label/value row
-├── Model.js                                    state machine and formatting helpers
-├── scripts/juice-stats                         read-only sysfs probe
-├── scripts/juice-devices                       every battery device as JSON
-├── scripts/juice-usage                         battery usage sampler and report
-├── scripts/juice-set-limit                     applies/restores a charge target
-├── udev/99-juice-charge-thresholds.rules       threshold write access
-├── systemd/juice-charge-target.service         login restore unit
-├── tests/icon-geometry                         glyph geometry regression check
-├── tests/color                                 bar glyph colour precedence
-├── tests/devices                               device parsing and detail rows
-├── tests/session                               session action catalogue and lookup
-├── tests/usage                                 usage aggregation report
-├── docs/architecture.md                        layer map, state ownership, data flow
-├── docs/screenshots/                           the plates above
-├── install.sh
-├── uninstall.sh
-├── LICENSE
-├── README.md
-└── .gitignore
+
+Other IPC methods: `open`, `close`, `show`, `hide`, `toggle`,
+`togglePercentage`, `setShowPercentage`, `setRedThreshold`, and
+`setPowerSaverThreshold`. The optional panel binding is:
+
+```lua
+o.bind("SUPER + ALT + B", "Battery (Juice)", "omarchy-shell thepathless.juice toggle")
 ```
+
+Add it to `~/.config/hypr/bindings.lua`, then reload Hyprland.
+
+## Development
+
+```sh
+for test in tests/color tests/devices tests/icon-geometry tests/session tests/usage; do
+  bash "$test" || exit 1
+done
+omarchy plugin validate .
+```
+
+The layer map, state ownership, data flow, and probe contracts are documented in
+[docs/architecture.md](docs/architecture.md).
 
 ## License
 
