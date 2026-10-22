@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Pins the session action catalogue: the order and glyphs the panel renders,
+# the unique hold letters and numbers, availability filtering, and the helper
+# that turns a typed key into an action.
+#
+# The hold timer itself lives in QML; this test covers the data and lookup
+# contract that the panel and HoldKeys.qml both consume.
+
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+command -v node >/dev/null || { printf 'skip: node not found\n' >&2; exit 77; }
+
+node --check "$root/Model.js"
+
+node - "$root/Model.js" <<'NODE'
+const M = require(process.argv[2])
+
+function check(label, actual, expected) {
+  const left = JSON.stringify(actual)
+  const right = JSON.stringify(expected)
+  if (left !== right) {
+    console.error(`FAIL ${label}: expected ${right}, got ${left}`)
+    process.exit(1)
+  }
+}
+
+const all = M.sessionActions({ suspend: true, hibernate: true })
+check("all ids", all.map(a => a.id), ["lock", "suspend", "hibernate", "reboot", "shutdown"])
+check("labels", all.map(a => a.label), ["Lock", "Sleep", "Hibernate", "Reboot", "Shut down"])
+check("hold letters", all.map(a => a.holdKey), ["L", "Z", "H", "R", "S"])
+check("icons", all.map(a => a.icon), ["", "󰒲", "󰤁", "󰜉", "󰐥"])
+check("commands", all.map(a => a.command),
+  ["omarchy-system-lock", "systemctl suspend", "systemctl hibernate",
+    "omarchy-system reboot", "omarchy-system shutdown"])
+check("unique letters", new Set(all.map(a => a.holdKey)).size, all.length)
+
+const limited = M.sessionActions({ suspend: false, hibernate: false })
+check("limited ids", limited.map(a => a.id), ["lock", "reboot", "shutdown"])
+check("numbering follows visible rows",
+  ["1", "2", "3"].map(key => M.sessionActionForKey(key, limited).id),
+  ["lock", "reboot", "shutdown"])
+check("hidden row has no number", M.sessionActionForKey("4", limited), null)
+
+check("letter lookup", ["L", "z", "H", "r", "s"].map(key => M.sessionActionForKey(key, all).id),
+  ["lock", "suspend", "hibernate", "reboot", "shutdown"])
+check("number lookup", ["1", "2", "3", "4", "5"].map(key => M.sessionActionForKey(key, all).id),
+  ["lock", "suspend", "hibernate", "reboot", "shutdown"])
+check("unknown key", [M.sessionActionForKey("x", all), M.sessionActionForKey("", all),
+  M.sessionActionForKey(null, all)], [null, null, null])
+
+check("by id", M.sessionActionById("suspend").label, "Sleep")
+check("unknown id", M.sessionActionById("nope"), null)
+check("availability", [
+  M.sessionActionAvailable(M.sessionActionById("suspend"), { suspend: true, hibernate: false }),
+  M.sessionActionAvailable(M.sessionActionById("suspend"), { suspend: false, hibernate: true }),
+  M.sessionActionAvailable(M.sessionActionById("lock"), {}),
+  M.sessionActionAvailable(null, {})
+], [true, false, true, false])
+
+check("probe good", M.parseSessionProbe('{"suspend":false,"hibernate":true}'),
+  { suspend: false, hibernate: true })
+check("probe partial", M.parseSessionProbe('{"hibernate":true}'),
+  { suspend: true, hibernate: true })
+check("probe garbage", M.parseSessionProbe("nope"), { suspend: true, hibernate: false })
+check("probe empty", M.parseSessionProbe(""), { suspend: true, hibernate: false })
+
+console.log("session: ok")
+NODE

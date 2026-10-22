@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# Pins the device and usage helpers in Model.js, and the JSON contract of the
+# connected-device probe. The probe runs against a recorded UPower dump, so the
+# test exercises the real parser without depending on what is plugged in today.
+
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+command -v node >/dev/null || { printf 'skip: node not found\n' >&2; exit 77; }
+command -v jq >/dev/null || { printf 'skip: jq not found\n' >&2; exit 77; }
+
+node --check "$root/Model.js"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# UPower's real `-d` shape: two space properties, a type block, four space
+# attributes. One Bluetooth headset, one USB receiver mouse, and the laptop's
+# own pack — which must never reach the connected-device list.
+cat >"$work/dump.txt" <<'DUMP'
+Device: /org/freedesktop/UPower/devices/battery_BAT0
+  native-path:          BAT0
+  model:                Test Pack
+  power supply:         yes
+  updated:              Thu 22 Oct 2026 11:00:00 AM IST (20 seconds ago)
+  has history:          yes
+  has statistics:       yes
+  battery
+    present:             yes
+    rechargeable:        yes
+    state:               discharging
+    warning-level:       none
+    energy:              30.37 Wh
+    energy-full:         38.2 Wh
+    energy-full-design:  45 Wh
+    energy-rate:         9.1 W
+    voltage:             12.225 V
+    percentage:          80%
+    capacity:            84.8889%
+    technology:          lithium-polymer
+    icon-name:          'battery-full-symbolic'
+
+Device: /org/freedesktop/UPower/devices/headset_dev_AA_BB_CC_DD_EE_FF
+  native-path:          /org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF
+  model:                Test Headset
+  serial:               AA:BB:CC:DD:EE:FF
+  power supply:         no
+  updated:              Thu 22 Oct 2026 11:00:00 AM IST (95 seconds ago)
+  has history:          yes
+  has statistics:       no
+  headset
+    warning-level:       none
+    percentage:          61%
+    icon-name:          'battery-missing-symbolic'
+
+Device: /org/freedesktop/UPower/devices/mouse_hidpp_battery_0
+  native-path:          hidpp_battery_0
+  model:                MX Master 3S
+  vendor:               Logitech
+  serial:               1234-ABCD
+  power supply:         no
+  updated:              Thu 22 Oct 2026 11:00:00 AM IST (12 seconds ago)
+  has history:          no
+  has statistics:       no
+  mouse
+    present:             yes
+    rechargeable:        yes
+    state:               discharging
+    warning-level:       low
+    percentage:          15%
+    capacity:            92.5%
+    technology:          lithium-ion
+    icon-name:          'battery-low-symbolic'
+
+Device: /org/freedesktop/UPower/devices/line_power_AC
+  native-path:          AC
+  power supply:         yes
+  updated:              Thu 22 Oct 2026 11:00:00 AM IST (30 seconds ago)
+  has history:          no
+  has statistics:       no
+  line-power
+    online:              yes
+    icon-name:          'ac-adapter-symbolic'
+
+Device: /org/freedesktop/UPower/devices/DisplayDevice
+  power supply:         yes
+  updated:              Thu 22 Oct 2026 11:00:00 AM IST (30 seconds ago)
+  has history:          no
+  has statistics:       no
+  battery
+    present:             yes
+    state:               discharging
+    percentage:          70%
+    icon-name:          'battery-good-symbolic'
+DUMP
+
+# A receiver HID pack resolves through its kernel power_supply node, which is
+# how a 2.4 GHz dongle mouse is recognised as wireless rather than generic USB.
+mkdir -p "$work/sys/class/power_supply/hidpp_battery_0"
+printf 'Battery\n' >"$work/sys/class/power_supply/hidpp_battery_0/type"
+printf 'Device\n' >"$work/sys/class/power_supply/hidpp_battery_0/scope"
+printf 'Discharging\n' >"$work/sys/class/power_supply/hidpp_battery_0/status"
+printf 'MX Master 3S\n' >"$work/sys/class/power_supply/hidpp_battery_0/model_name"
+
+JUICE_UPOWER_DUMP="$work/dump.txt" JUICE_SYSFS_ROOT="$work/sys" bash "$root/scripts/juice-devices" >"$work/devices.json"
+
+jq -e 'length == 2' "$work/devices.json" >/dev/null
+jq -e 'map(.kind) == ["headset", "mouse"]' "$work/devices.json" >/dev/null
+# The pack in the dump stays out: it is the machine's own battery, shown by the
+# panel hero and the battery-detail card, not a connected device.
+jq -e 'map(select(.kind == "battery" or .name == "Test Pack")) | length == 0' "$work/devices.json" >/dev/null
+jq -e 'map(.level) == [61, 15]' "$work/devices.json" >/dev/null
+jq -e '.[1].vendor == "Logitech" and .[1].capacity == 92.5 and .[1].present == true' "$work/devices.json" >/dev/null
+jq -e '.[1].sys.scope == "Device" and .[1].sys.bus == ""' "$work/devices.json" >/dev/null
+jq -e '.[0].updatedAge == 95' "$work/devices.json" >/dev/null
+jq -e 'all(.[]; .bt.battery == -1)' "$work/devices.json" >/dev/null
+
+# A connected BlueZ keyboard with no battery percentage, plus a 2.4 GHz HID
+# receiver that exposes no power_supply node: both must be listed with level -1.
+mkdir -p "$work/bt" "$work/sys/bus/usb/devices/3-9/3-9:1.1/0003:32C2:0066.0004/input/input11"
+cat >"$work/bt/11:22:33:44:55:66.txt" <<'BT'
+Device 11:22:33:44:55:66 (public)
+	Name: Test Keyboard
+	Alias: Test Keyboard
+	Class: 0x000540
+	Icon: input-keyboard
+	Paired: yes
+	Connected: yes
+	Trusted: yes
+	Modalias: usb:v05ACp0221d0000
+BT
+dev="$work/sys/bus/usb/devices/3-9"
+printf '00\n' >"$dev/bDeviceClass"
+printf '32c2\n' >"$dev/idVendor"
+printf '2.4G Wireless\n' >"$dev/product"
+printf '2.4G Wireless\n' >"$dev/manufacturer"
+printf '03\n' >"$dev/3-9:1.1/bInterfaceClass"
+printf '2.4G Wireless Mouse\n' >"$dev/3-9:1.1/0003:32C2:0066.0004/input/input11/name"
+
+# The receiver that made the section lie: the USB descriptor says nothing, and
+# only the HID node's own input name carries the wireless claim.
+mkdir -p "$work/sys/bus/usb/devices/3-7/3-7:1.0/0003:1A2C:7FFF.0001/input/input7"
+dev="$work/sys/bus/usb/devices/3-7"
+printf '00\n' >"$dev/bDeviceClass"
+printf 'USB Composite Device\n' >"$dev/product"
+printf '03\n' >"$dev/3-7:1.0/bInterfaceClass"
+printf 'HID_NAME=USB Composite Device\nHID_UNIQ=\n' >"$dev/3-7:1.0/0003:1A2C:7FFF.0001/uevent"
+printf '2.4G Wireless Mouse\n' >"$dev/3-7:1.0/0003:1A2C:7FFF.0001/input/input7/name"
+
+# Noise that must stay out: a hub, and a wired HID keyboard whose own input name
+# carries no wireless claim.
+mkdir -p "$work/sys/bus/usb/devices/usb1" \
+  "$work/sys/bus/usb/devices/2-1/2-1:1.0/0003:05AC:0221.0001/input/input3"
+printf '09\n' >"$work/sys/bus/usb/devices/usb1/bDeviceClass"
+printf 'xHCI Host Controller\n' >"$work/sys/bus/usb/devices/usb1/product"
+printf '00\n' >"$work/sys/bus/usb/devices/2-1/bDeviceClass"
+printf 'USB Keyboard\n' >"$work/sys/bus/usb/devices/2-1/product"
+printf '03\n' >"$work/sys/bus/usb/devices/2-1/2-1:1.0/bInterfaceClass"
+printf 'HID_NAME=USB Keyboard\n' >"$work/sys/bus/usb/devices/2-1/2-1:1.0/0003:05AC:0221.0001/uevent"
+printf 'USB Keyboard\n' >"$work/sys/bus/usb/devices/2-1/2-1:1.0/0003:05AC:0221.0001/input/input3/name"
+
+JUICE_UPOWER_DUMP="$work/dump.txt" JUICE_BLUETOOTH_INFO_DIR="$work/bt" \
+  JUICE_SYSFS_ROOT="$work/sys" bash "$root/scripts/juice-devices" >"$work/devices-extra.json"
+
+jq -e 'length == 5' "$work/devices-extra.json" >/dev/null
+jq -e 'map(select(.level == -1)) | length == 3' "$work/devices-extra.json" >/dev/null
+jq -e 'map(select(.name == "Test Keyboard" and .kind == "keyboard" and .bt.connected == true)) | length == 1' "$work/devices-extra.json" >/dev/null
+jq -e 'map(select(.name == "2.4G Wireless" and .kind == "mouse" and .sys.bus == "usb")) | length == 1' "$work/devices-extra.json" >/dev/null
+jq -e 'map(select(.name == "2.4G Wireless Mouse" and .kind == "mouse" and (.sys.path | endswith("3-7")))) | length == 1' "$work/devices-extra.json" >/dev/null
+jq -e 'map(.name) | index("USB Hub") == null and index("USB Keyboard") == null' "$work/devices-extra.json" >/dev/null
+jq -e 'all(.[]; .kind != "line-power" and .name != "AC")' "$work/devices-extra.json" >/dev/null
+jq -e 'map(select(.kind == "battery")) | length == 0' "$work/devices-extra.json" >/dev/null
+
+node - "$work/devices.json" "$root/Model.js" <<'NODE'
+const fs = require("fs")
+const devices = JSON.parse(fs.readFileSync(process.argv[2], "utf8"))
+const M = require(process.argv[3])
+
+function check(label, actual, expected) {
+  const left = JSON.stringify(actual)
+  const right = JSON.stringify(expected)
+  if (left !== right) {
+    console.error(`FAIL ${label}: expected ${right}, got ${left}`)
+    process.exit(1)
+  }
+}
+
+const headset = devices[0]
+const mouse = devices[1]
+
+check("sorted", M.sortDevices(devices).map(d => d.kind), ["headset", "mouse"])
+check("parse devices", M.parseDevices(JSON.stringify(devices)).map(d => d.kind), ["headset", "mouse"])
+check("parse devices rejects junk", [M.parseDevices(""), M.parseDevices("nope"), M.parseDevices("{}")], [null, null, null])
+check("parse usage rejects junk", [M.parseUsageReport(""), M.parseUsageReport("[]"), M.parseUsageReport("{\"today\":{}}")], [null, null, null])
+check("parse usage accepts report", M.parseUsageReport('{"daily":[]}').daily, [])
+check("subtitle", M.deviceSubtitle(headset), "Bluetooth · Headset")
+check("connection mouse", M.connectionLabel(mouse), "Wireless receiver")
+check("level", [M.deviceLevel(headset), M.deviceLevel(mouse)], [61, 15])
+check("state", M.deviceStateLabel(mouse), "On battery")
+check("level colour", M.deviceLevelColor(mouse, "normal", "green", "red", 20), "red")
+check("age", M.formatAge(95), "2m ago")
+check("class label", M.bluetoothClassLabel("0x00340404"), "Audio / video · Wearable headset")
+check("class empty", M.bluetoothClassLabel(""), "")
+
+const groups = M.deviceDetailGroups(mouse)
+check("groups", groups.map(g => g.title), ["BATTERY", "CONNECTION", "DEVICE", "SYSTEM"])
+const batteryRows = groups[0].rows.map(row => row.label)
+check("battery rows", batteryRows, ["Level", "State", "Health", "Technology", "Warning level", "Rechargeable", "Reported"])
+check("last flag", groups[0].rows[groups[0].rows.length - 1].last, true)
+check("no blank values", groups.some(g => g.rows.some(r => r.value.trim() === "")), false)
+
+check("span", [M.formatSpan(0), M.formatSpan(60), M.formatSpan(10140)], ["0m", "1m", "2h 49m"])
+check("duration", [M.formatDuration(0), M.formatDuration(20), M.formatDuration(30), M.formatDuration(10140), M.formatDuration(3600)],
+  ["", "<1m", "1m", "2h 49m", "1h"])
+check("level label owner", [M.deviceLevelLabel({ level: 61 }), M.deviceLevelLabel({ level: -1 })], ["61%", "Not reported"])
+// A receiver reports a level and a connection, nothing else: no invented state
+// row, no UPower node it does not have.
+check("receiver rows", M.deviceDetailGroups({ kind: "keyboard", level: -1 }).map(group => group.rows.map(row => row.label)),
+  [["Level"], ["Connection", "Kind"]])
+check("receiver label", M.kindLabel("receiver"), "Wireless receiver")
+check("percent", [M.formatPercent(47.4), M.formatPercent(0.4), M.formatPercent(-1)], ["47%", "<1%", "—"])
+check("usage date", M.formatUsageDate("2026-10-22"), "22 Oct 2026")
+check("usage date invalid", M.formatUsageDate("nope"), "")
+check("scale", [M.usageTopScale([{ used: 40 }]), M.usageTopScale([{ used: 40 }, { used: 172 }])], [100, 200])
+check("level colours", [
+  M.usageLevelColor(80, "g", "y", "r"),
+  M.usageLevelColor(30, "g", "y", "r"),
+  M.usageLevelColor(8, "g", "y", "r")
+], ["g", "y", "r"])
+check("hour labels", [0, 6, 12, 18, 3].map(M.hourLabel), ["12A", "6", "12P", "6", ""])
+check("app label", M.appLabel("chrome-web.whatsapp.com__-Default"), "Chrome web.whatsapp.com")
+check("app label empty", M.appLabel(""), "Unknown")
+
+const report = {
+  now: { clock: "11:06" },
+  today: { usedPct: 47 },
+  comparison: { averageByNow: 45, days: 3 }
+}
+check("similar", M.usageSentence(report), "You're using a similar amount of battery today as you usually do by 11:06")
+check("more", M.usageSentence({ now: { clock: "11:06" }, today: { usedPct: 90 }, comparison: { averageByNow: 45, days: 3 } }),
+  "You're using more battery than usual by 11:06")
+check("less", M.usageSentence({ now: { clock: "11:06" }, today: { usedPct: 10 }, comparison: { averageByNow: 45, days: 3 } }),
+  "You're using less battery than usual by 11:06")
+check("fresh install", M.usageSentence({ now: { clock: "11:06" }, today: { usedPct: 0 }, comparison: { averageByNow: null, days: 0 } }),
+  "Tracking battery usage from today — the week fills in as it runs")
+
+// Day selection: the card looks a tapped bar up by date, and says what a past
+// day can honestly show. An unmetered day is never reported as 0%.
+const usageReport = {
+  daily: [
+    { date: "2026-10-16", used: null, measured: false, hours: [], apps: [] },
+    { date: "2026-10-21", used: 7.5, measured: true, screenOn: 3600, screenOff: 600, apps: [{ name: "chrome", pct: 5 }] },
+    { date: "2026-10-22", used: 1.875, measured: true, today: true, apps: [] }
+  ]
+}
+check("day lookup", M.usageDay(usageReport, "2026-10-21").used, 7.5)
+check("day lookup misses", [M.usageDay(usageReport, "2026-10-01"), M.usageDay(usageReport, ""), M.usageDay({}, "2026-10-21"), M.usageDay(usageReport, null)], [null, null, null, null])
+check("day sentence", M.usageDaySentence(usageReport.daily[1]), "You used 8% of the battery that day")
+check("day sentence zero", M.usageDaySentence({ date: "2026-10-20", measured: true, used: 0 }), "No battery discharge was recorded that day")
+check("day sentence empty", [M.usageDaySentence(usageReport.daily[0]), M.usageDaySentence(null)], ["No measurements were recorded for this day", "No measurements were recorded for this day"])
+// A day with holes is a partial reading, not a whole-day total: the sentence
+// names how many hourly buckets were actually observed.
+const fullHours = Array.from({ length: 24 }, (_, h) => ({ h, level: 50 }))
+const partialHours = Array.from({ length: 24 }, (_, h) => ({ h, level: h < 6 ? 50 : null }))
+const oneHour = Array.from({ length: 24 }, (_, h) => ({ h, level: h < 1 ? 50 : null }))
+check("day partial flag", [
+  M.usageDayIsPartial({ measured: true, hours: fullHours }),
+  M.usageDayIsPartial({ measured: true, hours: partialHours }),
+  M.usageDayIsPartial({ measured: true, hours: partialHours, today: true }),
+  M.usageDayIsPartial({ measured: false, hours: partialHours })
+], [false, true, false, false])
+check("day sentence full", M.usageDaySentence({ measured: true, used: 7.5, hours: fullHours }), "You used 8% of the battery that day")
+check("day sentence partial", M.usageDaySentence({ measured: true, used: 37.5, hours: partialHours }),
+  "Only 6 hours of this day were measured — you used 38% of the battery in them")
+check("day sentence partial zero", M.usageDaySentence({ measured: true, used: 0, hours: partialHours }),
+  "Only 6 hours of this day were measured, and no battery discharge was recorded in them")
+check("day sentence partial unknown", M.usageDaySentence({ measured: true, used: null, hours: partialHours }),
+  "Only 6 hours of this day were measured, so battery use could not be totalled")
+check("day sentence partial singular", M.usageDaySentence({ measured: true, used: 7.5, hours: oneHour }),
+  "Only 1 hour of this day was measured — you used 8% of the battery in it")
+check("day apps note", [
+  M.usageDayAppsNote(usageReport.daily[1]),
+  M.usageDayAppsNote(usageReport.daily[0]),
+  M.usageDayAppsNote(null)
+], ["", "App breakdown wasn't recorded for this day", "No app activity was recorded for this day"])
+check("day short date", [M.usageShortDate("2026-10-21"), M.usageShortDate("nope")], ["21 Oct", ""])
+check("day percent label", [
+  M.usagePercentLabel(usageReport.daily[1], null),
+  M.usagePercentLabel(usageReport.daily[0], null),
+  M.usagePercentLabel(null, { usedPct: 39.5 }),
+  M.usagePercentLabel(null, {}),
+  M.usagePercentLabel({ measured: true, used: null }, null)
+], ["8%", "—", "40%", "—", "—"])
+NODE
+
+printf 'connected devices OK\n'

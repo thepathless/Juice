@@ -11,18 +11,27 @@ import "Model.js" as Model
 
 // Juice — battery bar widget and panel.
 //
-// This is a clone of Omarchy's built-in omarchy.power panel: the bar button,
-// hero, charge bar, stats row, power-profile picker, keyboard handling, theming
-// hooks (root.bar.foreground / root.bar.fontFamily / Commons.Color) and the
-// omarchy-* commands it shells out to are all kept as-is. Two sections are
-// added:
+// Built on Omarchy's omarchy.power panel: the bar button, keyboard handling,
+// theming hooks (root.bar.foreground / root.bar.fontFamily / Commons.Color) and
+// the omarchy-* commands it shells out to are kept as-is. The panel opens as a
+// hero card — level, state, time left and live wattage — followed by the
+// sections that are worth having permanently in view:
 //
-//   1. CHARGE LIMIT — writes the kernel charge thresholds (80% / 100%) through
-//      scripts/juice-set-limit and always reports what the hardware
-//      actually holds, never what we asked for.
-//   2. BATTERY DETAIL — the detailed sysfs telemetry in a fixed-height iOS
-//      inset card with HEALTH | POWER | SPECS tabs, so all eighteen values
-//      live on one page without scrolling.
+//   1. CHARGE TARGET — writes the kernel charge thresholds (80% / 100%) through
+//      scripts/juice-set-limit and always reports what the hardware actually
+//      holds, never what we asked for.
+//   2. POWER PROFILE — the power-profiles picker.
+//   3. SESSION — hold Lock / Sleep / Hibernate / Reboot / Shut down for three
+//      seconds. Plain letters only while this panel has focus, so Omarchy's
+//      own Super shortcuts are untouched.
+//
+// BATTERY DETAIL, CONNECTED DEVICES, BATTERY USAGE, USAGE BY APP and OPTIONS
+// disclose in place; every open starts with those five closed and the usage
+// card on today. OPTIONS stays closed so the settings never crowd the live
+// controls.
+//
+// The card scrolls when its permanent sections make it taller than the space
+// under the bar.
 Panel {
   id: root
   moduleName: "thepathless.juice"
@@ -31,7 +40,6 @@ Panel {
   // permits — needed for the charge-target and togglePercentage methods below.
   manageIpc: false
   property var batteryInfo: ({})
-  property var systemInfo: ({})
   property var profiles: []
   property string activeProfile: ""
   property int profileIndex: 0
@@ -65,6 +73,7 @@ Panel {
   readonly property color appleGreen: "#30D158"
   readonly property color appleYellow: "#FFD60A"
   readonly property color appleRed: "#FF453A"
+  readonly property color appleBlue: "#0A84FF"
   property bool autoSaverEngaged: false
   // Profile the user was running before the saver was engaged, so releasing
   // restores exactly that instead of guessing from stored preferences.
@@ -75,8 +84,9 @@ Panel {
   readonly property int batteryLevel: Model.batteryLevel(UPower.displayDevice)
   readonly property string batteryState: Model.batteryState(UPower.displayDevice, root.onBattery, root.chargeLimitEnd)
   readonly property string batteryStateText: Model.stateLabel(root.batteryState, root.batteryLevel)
-  // Apple's rules: red under the low threshold, yellow while Low Power Mode
-  // (power-saver) is the active profile, green while current flows in, theme
+  // Apple's rules, with charging first: green while current flows in even
+  // below the low threshold or in power-saver, yellow while Low Power Mode
+  // (power-saver) is the active profile, red under the low threshold, theme
   // foreground the rest of the time. The threshold is user-tunable.
   readonly property int redBatteryThreshold: Model.redThreshold(setting("redThreshold", 20), 20)
   readonly property bool powerSaverActive: PowerProfiles.profile === PowerProfile.PowerSaver
@@ -105,27 +115,126 @@ Panel {
   readonly property string timeRemainingText: Model.timeRemainingLabel(
     root.batteryState, UPower.displayDevice ? UPower.displayDevice.timeToEmpty : 0,
     UPower.displayDevice ? UPower.displayDevice.timeToFull : 0)
+  readonly property bool autoPowerSaver: Model.boolSetting(setting("autoPowerSaver", true), true)
   readonly property int powerSaverThreshold: Model.powerSaverThreshold(setting("powerSaverThreshold", 50), 50)
 
   readonly property string statsScript: decodeURIComponent(
     Qt.resolvedUrl("scripts/juice-stats").toString().replace(/^file:\/\//, ""))
   readonly property string limitScript: decodeURIComponent(
     Qt.resolvedUrl("scripts/juice-set-limit").toString().replace(/^file:\/\//, ""))
+  readonly property string devicesScript: decodeURIComponent(
+    Qt.resolvedUrl("scripts/juice-devices").toString().replace(/^file:\/\//, ""))
+  readonly property string usageScript: decodeURIComponent(
+    Qt.resolvedUrl("scripts/juice-usage").toString().replace(/^file:\/\//, ""))
+
+  // ---- Juice: connected devices and battery usage ------------------------
+  //
+  // Every row below is a device the system itself reports a battery for, and
+  // every usage number is metered from sysfs, Hyprland and UPower history by
+  // scripts/juice-usage. The panel only formats what those two probes found.
+  property var deviceList: []
+  property string expandedDevice: ""
+  property var usageInfo: ({})
+  property bool usageUnavailable: false
+
+  // ---- Juice: session power actions ---------------------------------------
+  //
+  // The five actions are plain-key holds inside the focused panel. No
+  // compositor binding is involved, so Super+L and Super+S keep their Omarchy
+  // meanings everywhere; only HoldKeys.qml sees these keys.
+  property var sessionAvailable: ({ suspend: true, hibernate: false })
+  readonly property var sessionActions: Model.sessionActions(root.sessionAvailable)
+  readonly property int sessionHoldMs: 3000
+  property string sessionHoldId: ""
+  property real sessionHoldProgress: 0
+  readonly property var sessionHoldAction: Model.sessionActionById(root.sessionHoldId)
+
+  // ---- Juice: section disclosure -------------------------------------------
+  //
+  // The data-heavy sections and OPTIONS disclose. CHARGE TARGET, POWER
+  // PROFILE and SESSION stay permanent, so the live controls are always
+  // visible and only the secondary material folds away.
+  property bool detailOpen: false
+  property bool devicesOpen: false
+  property bool usageOpen: false
+  property bool appsOpen: false
+  property bool optionsOpen: false
+
+  // The headers summarise a closed section, so a glance still answers the
+  // question without opening anything. Each is built from the same live state
+  // the body renders, never from a cached copy.
+  readonly property string activeProfileLabel: root.activeProfile === "" ? ""
+    : (root.activeProfile === "power-saver" ? "Saver"
+    : (root.activeProfile === "performance" ? "Performance" : "Balanced"))
+  readonly property string usageSummary: {
+    // A closed section still says which day is open, so the panel never hides
+    // that the card below is showing Tuesday rather than today.
+    if (root.showingPastDay) {
+      var day = root.selectedUsageDay
+      return Model.usageShortDate(day.date) + " · " + Model.usagePercentLabel(day, null)
+    }
+    var today = root.usageInfo.today
+    if (!today || today.usedPct === undefined) return ""
+    // Same formatter the card's own heading uses, so summary and body agree.
+    return Model.usagePercentLabel(null, today) + " today"
+  }
+
+  function collapseSections() {
+    root.detailOpen = false
+    root.devicesOpen = false
+    root.usageOpen = false
+    root.appsOpen = false
+    root.optionsOpen = false
+    // A device drop-down left open last time would spring open under an
+    // otherwise minimal panel; every open starts from one closed row.
+    root.expandedDevice = ""
+    // The usage card always opens on today, never on the day last inspected.
+    root.usageDay = ""
+  }
+
+  readonly property var usageApps: Array.isArray(root.usageInfo.apps) ? root.usageInfo.apps.slice(0, 8) : []
+  readonly property bool usageReady: Array.isArray(root.usageInfo.daily) && root.usageInfo.daily.length > 0
+
+  // ---- Juice: which usage day is open --------------------------------------
+  //
+  // "" is the live/today view. Tapping a bar in the card sets an ISO date; the
+  // card then draws that day's own curve and totals, and the app section below
+  // shows that day's rows or says plainly that none were recorded.
+  property string usageDay: ""
+  readonly property var selectedUsageDay: Model.usageDay(root.usageInfo, root.usageDay)
+  readonly property bool showingPastDay: root.usageDay !== ""
+    && root.selectedUsageDay !== null && !root.selectedUsageDay.today
+  readonly property var usageAppList: root.showingPastDay
+    ? (Array.isArray(root.selectedUsageDay.apps) ? root.selectedUsageDay.apps.slice(0, 8) : [])
+    : root.usageApps
+  readonly property string usageAppsNote: root.showingPastDay
+    ? Model.usageDayAppsNote(root.selectedUsageDay)
+    : (root.usageInfo.appsNote || "")
+
+  function selectUsageDay(date) {
+    root.usageDay = (date === undefined || date === null) ? "" : String(date)
+  }
+
+  function refreshDevices() {
+    if (devicesProc.running) return
+    devicesProc.running = true
+  }
+
+  function refreshUsage() {
+    if (usageProc.running) return
+    usageProc.running = true
+  }
+
 
   readonly property bool statsLoaded: statsInfo.capacity !== undefined
   readonly property int chargeLimitEnd: {
     var n = parseInt(root.statsInfo.threshold_end, 10)
     return isNaN(n) ? -1 : n
   }
-  readonly property int chargeLimitStart: {
-    var n = parseInt(root.statsInfo.threshold_start, 10)
-    return isNaN(n) ? -1 : n
-  }
   readonly property bool chargeLimitSupported: root.chargeLimitEnd >= 0
   readonly property bool acOnline: root.statsInfo.ac_online === "1"
   readonly property string energyUnit: root.statsInfo.unit || "Wh"
   readonly property real healthPercent: Model.batteryHealth(root.statsInfo.energy_full, root.statsInfo.energy_full_design)
-  readonly property real healthFraction: Model.healthFraction(root.statsInfo.energy_full, root.statsInfo.energy_full_design)
   readonly property string healthGrade: Model.healthGrade(root.healthPercent)
   // The subtitle under the charge bar, built from the same derived state and
   // limit the glyph uses, so the sentence can never contradict the icon.
@@ -209,7 +318,6 @@ Panel {
 
     if (!batteryProc.running) batteryProc.running = true
     if (!profilesProc.running) profilesProc.running = true
-    if (!systemProc.running) systemProc.running = true
   }
 
   function refreshStats() {
@@ -217,13 +325,12 @@ Panel {
     if (!statsProc.running) statsProc.running = true
   }
 
-  function updateKeyValue(raw, targetName) {
+  function updateBattery(raw) {
     var next = Model.parseKeyValue(raw)
     // Keep last known good data if a refresh briefly returns nothing — happens
     // around AC plug/unplug events. Avoids the section collapsing mid-transition.
     if (Object.keys(next).length === 0) return
-    if (targetName === "battery") batteryInfo = next
-    else systemInfo = next
+    batteryInfo = next
   }
 
   function updateProfiles(raw) {
@@ -260,9 +367,52 @@ Panel {
   }
 
   // Numbers commit on Return and hand the keyboard back to the panel, so
-  // Escape and the arrow-key profile picker keep working afterwards.
+  // Escape, the arrow-key profile picker and the session holds keep working
+  // afterwards. HoldKeys is the layer that owns plain-letter holds.
   function releaseFieldFocus() {
-    if (keyCatcher) keyCatcher.forceActiveFocus()
+    if (holdKeys) holdKeys.forceActiveFocus()
+  }
+
+  // ---- Juice: session hold -------------------------------------------------
+
+  function refreshSession() {
+    if (sessionProbe.running) return
+    sessionProbe.running = true
+  }
+
+  function beginSessionHold(id) {
+    var action = Model.sessionActionById(String(id === undefined || id === null ? "" : id))
+    if (!action || !Model.sessionActionAvailable(action, root.sessionAvailable)) return
+    if (root.sessionHoldId !== "") root.cancelSessionHold()
+    root.sessionHoldId = action.id
+    root.sessionHoldProgress = 0
+    sessionHoldFill.restart()
+    sessionHoldTimer.restart()
+  }
+
+  // The id is optional: keyboard focus loss cancels whatever is active, while
+  // a tile release must only cancel its own hold.
+  function cancelSessionHold(id) {
+    if (id !== undefined && id !== null && String(id) !== root.sessionHoldId) return
+    sessionHoldTimer.stop()
+    sessionHoldFill.stop()
+    root.sessionHoldProgress = 0
+    root.sessionHoldId = ""
+  }
+
+  function completeSessionHold() {
+    var action = root.sessionHoldAction
+    root.cancelSessionHold()
+    if (!action) return
+    root.close()
+    Quickshell.execDetached(["bash", "-lc", action.command])
+  }
+
+  // A short H/L tap goes through the same profile cursor the arrow keys use.
+  function moveProfileHorizontal(direction) {
+    if (direction === 0) return
+    if (!root.cursorActive) { root.cursorActive = true; return }
+    root.selectProfileByDelta(direction)
   }
 
   // Bar-widget options live in this widget's inline shell.json entry — the same
@@ -279,8 +429,20 @@ Panel {
 
   // Engages power-saver when the battery drops to the configured level, and
   // releases it a few points above that so the profile does not flap at the
-  // boundary. Called from UPower bindings, never from a timer.
+  // boundary. The OPTIONS switch disables both directions and releases a
+  // profile the automation already engaged. Called from UPower bindings, never
+  // from a timer.
   function evaluatePowerSaver() {
+    // Turning automation off also releases a profile it engaged earlier, so
+    // the switch cannot leave the machine stranded in power-saver.
+    if (!root.autoPowerSaver) {
+      if (root.autoSaverEngaged) {
+        root.autoSaverEngaged = false
+        root.setRuntimeProfile(root.saverRestoreProfile)
+      }
+      return
+    }
+
     var device = UPower.displayDevice
     if (!device || !device.isPresent) return
 
@@ -302,6 +464,7 @@ Panel {
     }
   }
 
+  onAutoPowerSaverChanged: root.evaluatePowerSaver()
   onPowerSaverThresholdChanged: root.evaluatePowerSaver()
 
   // ---- Juice: charge targets ----------------------------------------------
@@ -391,6 +554,7 @@ Panel {
         statsLoaded: root.statsLoaded,
         showPercentage: root.showPercentage,
         borderless: root.borderlessStyle,
+        autoPowerSaver: root.autoPowerSaver,
         powerSaverThreshold: root.powerSaverThreshold,
         autoSaverEngaged: root.autoSaverEngaged
       })
@@ -398,6 +562,21 @@ Panel {
 
     function charge80() { root.applyChargeTarget(80) }
     function charge100() { root.applyChargeTarget(100) }
+
+    // Scriptable views of the two new surfaces, for keybinds and for checking
+    // the live data without a screenshot.
+    function devices(): string { return JSON.stringify(root.deviceList) }
+    function usage(): string { return JSON.stringify(root.usageInfo) }
+
+    // The open card's screen rectangle, so a capture can be cropped to it
+    // exactly (the popup lives inside a full-screen layer surface, which the
+    // compositor reports at monitor size rather than at the card's).
+    function card(): string {
+      return JSON.stringify({
+        x: Math.round(panel.cardOrigin.x), y: Math.round(panel.cardOrigin.y),
+        width: Math.round(panel.contentWidth), height: Math.round(panel.contentHeight)
+      })
+    }
   }
 
   onOpenedChanged: {
@@ -405,6 +584,9 @@ Panel {
       // A reopened panel always starts on HEALTH; switching tabs inside one
       // open session still persists.
       detailTab = 0
+      // Only the four disclosures reset; the permanent sections stay put.
+      root.collapseSections()
+      root.cancelSessionHold()
 
       if (!batteryPresent) {
         close()
@@ -413,10 +595,15 @@ Panel {
 
       refresh()
       refreshStats()
+      root.refreshDevices()
+      root.refreshUsage()
+      root.refreshSession()
       root.evaluatePowerSaver()
       var idx = profiles.indexOf(activeProfile)
       profileIndex = idx >= 0 ? idx : 0
       cursorActive = false
+    } else {
+      root.cancelSessionHold()
     }
   }
 
@@ -437,7 +624,7 @@ Panel {
   Process {
     id: batteryProc
     command: ["omarchy-battery-status", "--shell"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateKeyValue(text, "battery") }
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateBattery(text) }
   }
 
   Process {
@@ -446,10 +633,21 @@ Panel {
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateProfiles(text) }
   }
 
+  // Session capability probe. Matches the conditions Omarchy's own system
+  // menu uses: sleep disappears while suspend-off or sleep-disabled is set,
+  // and hibernate only appears where the hibernation helper succeeds.
   Process {
-    id: systemProc
-    command: ["omarchy-system-stats"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateKeyValue(text, "system") }
+    id: sessionProbe
+    command: ["bash", "-lc",
+      'sleep_disabled=0; omarchy-sleep-disabled >/dev/null 2>&1 && sleep_disabled=1; ' +
+      'suspend=true; [ "$sleep_disabled" -eq 0 ] || suspend=false; ' +
+      'omarchy-toggle-enabled suspend-off >/dev/null 2>&1 && suspend=false; ' +
+      'hibernate=false; [ "$sleep_disabled" -eq 0 ] && omarchy-hibernation-available >/dev/null 2>&1 && hibernate=true; ' +
+      'printf \'{"suspend":%s,"hibernate":%s}\\n\' "$suspend" "$hibernate"']
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.sessionAvailable = Model.parseSessionProbe(text)
+    }
   }
 
   // Battery telemetry straight from sysfs. Read-only, bounded, and only while
@@ -517,10 +715,92 @@ Panel {
     }
   }
 
+  // The tile fill is visual only; the timer is the source of truth. Both are
+  // reset together by cancelSessionHold(), so a released key can never leave a
+  // half-filled tile or fire later from the background.
+  Timer {
+    id: sessionHoldTimer
+    interval: root.sessionHoldMs
+    repeat: false
+    onTriggered: root.completeSessionHold()
+  }
+
+  NumberAnimation {
+    id: sessionHoldFill
+    target: root
+    property: "sessionHoldProgress"
+    from: 0
+    to: 1
+    duration: root.sessionHoldMs
+    easing.type: Easing.Linear
+  }
+
+  // Connected devices: UPower's own dump plus BlueZ and sysfs detail. Polled
+  // only while the panel is open (and once at startup so IPC has data).
+  Process {
+    id: devicesProc
+    command: ["bash", root.devicesScript]
+    stdout: StdioCollector {
+      waitForEnd: true
+      // A failed probe leaves the last good list on screen rather than
+      // blanking the section on a transient UPower hiccup.
+      onStreamFinished: {
+        var list = Model.parseDevices(text)
+        if (list) root.deviceList = list
+      }
+    }
+  }
+
+  // Battery usage: the sampler runs for as long as the shell does, so the day's
+  // history is continuous even while this panel is closed.
+  Process {
+    id: usageSampler
+    command: ["python3", root.usageScript, "--daemon"]
+    running: true
+    onExited: function(code) { root.usageUnavailable = code !== 0 }
+  }
+
+  Process {
+    id: usageProc
+    command: ["python3", root.usageScript, "--report"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      // Keep the previous report; the usage card stays readable.
+      onStreamFinished: {
+        var report = Model.parseUsageReport(text)
+        if (report) {
+          root.usageInfo = report
+          root.usageUnavailable = false
+        }
+      }
+    }
+    onExited: function(code) {
+      if (code !== 0) root.usageUnavailable = true
+    }
+  }
+
+  Timer {
+    interval: 15000
+    running: root.opened
+    repeat: true
+    onTriggered: root.refreshDevices()
+  }
+
+  Timer {
+    interval: 60000
+    running: root.opened && root.usageReady
+    repeat: true
+    onTriggered: root.refreshUsage()
+  }
+
   // Probe once at startup so the charge-target section can show the truth even
-  // before the panel is opened for the first time.
+  // before the panel is opened for the first time, and so the session strip
+  // never offers a sleep state this machine cannot enter.
   Component.onCompleted: {
     root.refreshStats()
+    root.refreshDevices()
+    root.refreshUsage()
+    root.refreshSession()
     root.evaluatePowerSaver()
   }
 
@@ -645,7 +925,7 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened && root.batteryPresent
-    focusTarget: keyCatcher
+    focusTarget: holdKeys
     contentWidth: panel.fittedContentWidth(Style.space(290))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
@@ -661,9 +941,9 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      // The card is capped to the space under the bar, and the dashboard is
-      // taller than that on a 1080p screen: without a scroll container the
-      // OPTIONS rows fall off the card and can't be clicked at all.
+      // The card is capped to the space under the bar, and opening a tall
+      // disclosure can exceed that on a 1080p screen: without a scroll
+      // container the last rows fall off the card and can't be clicked.
       Flickable {
         id: panelFlick
         anchors.fill: parent
@@ -672,10 +952,15 @@ Panel {
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
-        interactive: contentHeight > height
+        // A fitted card can still be a fraction of a pixel taller than its
+        // rounded interior. Counting that as overflow flicked a scrollbar on
+        // for a view that fits and stole 17 px from every row beneath it, so
+        // only a whole pixel of overflow makes the card scroll.
+        readonly property bool overflows: contentHeight > height + 1
+        interactive: overflows
         ScrollBar.vertical: ScrollBar {
           id: panelScroll
-          policy: ScrollBar.AsNeeded
+          policy: panelFlick.overflows ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
         }
       }
 
@@ -815,123 +1100,129 @@ Panel {
           }
         }
 
-        // ---------- Charge Limit Segmented Control ----------
-        Column {
+        SectionCard {
           width: parent.width
-          spacing: Style.space(6)
+          title: "CHARGE TARGET"
+          summary: root.chargeLimitSupported ? "Limit " + root.chargeLimitEnd + "%" : "Unsupported"
+          collapsible: false
+          expanded: true
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
 
-          PanelSectionHeader {
-            text: "CHARGE TARGET"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-          }
-
-          RowLayout {
-            id: limitRow
+          Column {
             width: parent.width
             spacing: Style.space(6)
 
-            Button {
-              Layout.fillWidth: true
-              iconText: "󰂊"
-              iconSize: Style.font.title
-              text: "80% Limit"
-              fontSize: Style.font.bodySmall
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY
-              bordered: true
-              active: root.chargeLimitEnd === 80
-              enabled: root.chargeLimitSupported && !root.limitApplying
-              opacity: enabled ? 1.0 : 0.45
-              onClicked: root.applyChargeTarget(80)
-            }
+            RowLayout {
+              id: limitRow
+              width: parent.width
+              spacing: Style.space(6)
 
-            Button {
-              Layout.fillWidth: true
-              iconText: "󰂅"
-              iconSize: Style.font.title
-              text: "100% Full"
-              fontSize: Style.font.bodySmall
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY
-              bordered: true
-              active: root.chargeLimitEnd === 100
-              enabled: root.chargeLimitSupported && !root.limitApplying
-              opacity: enabled ? 1.0 : 0.45
-              onClicked: root.applyChargeTarget(100)
-            }
-          }
-
-          // No elide: every sentence this label can hold is short enough for
-          // the card, so a missing tail would only ever hide a real bug.
-          Text {
-            textFormat: Text.PlainText
-            width: parent.width
-            text: root.statsLoaded ? root.chargeStateText : "Reading hardware state…"
-            color: root.bar.foreground
-            opacity: 0.6
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            width: parent.width
-            visible: root.limitFeedback !== ""
-            text: root.limitFeedback
-            color: root.limitFeedbackError ? Commons.Color.urgent : root.bar.foreground
-            opacity: root.limitFeedbackError ? 1.0 : 0.7
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-          }
-        }
-
-        // ---------- Power Profile Switcher ----------
-        Column {
-          width: parent.width
-          spacing: Style.space(6)
-
-          PanelSectionHeader {
-            text: "POWER PROFILE"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-          }
-
-          RowLayout {
-            id: profileRow
-            width: parent.width
-            spacing: Style.space(6)
-
-            Repeater {
-              model: root.profiles
               Button {
-                required property var modelData
-                required property int index
                 Layout.fillWidth: true
-                iconText: root.profileIcon(String(modelData))
+                iconText: "󰂊"
                 iconSize: Style.font.title
-                text: String(modelData) === "power-saver" ? "Saver" : (String(modelData) === "performance" ? "Perf" : "Balanced")
+                text: "80% Limit"
                 fontSize: Style.font.bodySmall
                 foreground: root.bar.foreground
                 fontFamily: root.bar.fontFamily
-                horizontalPadding: Style.space(6)
+                horizontalPadding: Style.spacing.controlPaddingX
                 verticalPadding: Style.spacing.controlPaddingY
                 bordered: true
-                active: root.activeProfile === modelData
-                hasCursor: root.cursorActive && root.profileIndex === index
-                onClicked: {
-                  root.autoSaverEngaged = false
-                  root.setProfile(modelData)
-                }
-                onHovered: function(h) {
-                  if (h) {
-                    root.cursorActive = true
-                    root.profileIndex = index
+                active: root.chargeLimitEnd === 80
+                enabled: root.chargeLimitSupported && !root.limitApplying
+                opacity: enabled ? 1.0 : 0.45
+                onClicked: root.applyChargeTarget(80)
+              }
+
+              Button {
+                Layout.fillWidth: true
+                iconText: "󰂅"
+                iconSize: Style.font.title
+                text: "100% Full"
+                fontSize: Style.font.bodySmall
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                horizontalPadding: Style.spacing.controlPaddingX
+                verticalPadding: Style.spacing.controlPaddingY
+                bordered: true
+                active: root.chargeLimitEnd === 100
+                enabled: root.chargeLimitSupported && !root.limitApplying
+                opacity: enabled ? 1.0 : 0.45
+                onClicked: root.applyChargeTarget(100)
+              }
+            }
+
+            // No elide: every sentence this label can hold is short enough for
+            // the card, so a missing tail would only ever hide a real bug.
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: root.statsLoaded ? root.chargeStateText : "Reading hardware state…"
+              color: root.bar.foreground
+              opacity: 0.6
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              visible: root.limitFeedback !== ""
+              text: root.limitFeedback
+              color: root.limitFeedbackError ? Commons.Color.urgent : root.bar.foreground
+              opacity: root.limitFeedbackError ? 1.0 : 0.7
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+        }
+
+        SectionCard {
+          width: parent.width
+          title: "POWER PROFILE"
+          summary: root.activeProfileLabel
+          collapsible: false
+          expanded: true
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
+            RowLayout {
+              id: profileRow
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: root.profiles
+                Button {
+                  required property var modelData
+                  required property int index
+                  Layout.fillWidth: true
+                  iconText: root.profileIcon(String(modelData))
+                  iconSize: Style.font.title
+                  text: String(modelData) === "power-saver" ? "Saver" : (String(modelData) === "performance" ? "Perf" : "Balanced")
+                  fontSize: Style.font.bodySmall
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  horizontalPadding: Style.space(6)
+                  verticalPadding: Style.spacing.controlPaddingY
+                  bordered: true
+                  active: root.activeProfile === modelData
+                  hasCursor: root.cursorActive && root.profileIndex === index
+                  onClicked: {
+                    root.autoSaverEngaged = false
+                    root.setProfile(modelData)
+                  }
+                  onHovered: function(h) {
+                    if (h) {
+                      root.cursorActive = true
+                      root.profileIndex = index
+                    }
                   }
                 }
               }
@@ -939,190 +1230,318 @@ Panel {
           }
         }
 
-        // ---------- Battery detail (iOS inset card with segmented tabs) ----------
-        Column {
-          visible: root.statsLoaded
+        SectionCard {
           width: parent.width
-          spacing: Style.space(6)
+          title: "SESSION"
+          collapsible: false
+          expanded: true
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
 
-          PanelSectionHeader {
-            text: "BATTERY DETAIL"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-          }
-
-          Rectangle {
+          SessionActions {
             width: parent.width
-            height: detailTabs.height + detailBody.height + Style.space(27)
-            // Inset-grouped corner radius: 10 pt at 17 pt body, 0.588 here.
-            radius: Style.cornerRadius > 0 ? Math.min(6, Style.cornerRadius) : 6
-            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.03)
-            border.width: 1
-            border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
+            actions: root.sessionActions
+            holdMs: root.sessionHoldMs
+            holdingId: root.sessionHoldId
+            holdProgress: root.sessionHoldProgress
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            accentColor: Commons.Color.accent
+            urgentColor: Commons.Color.urgent
+            onHoldStarted: function(id) { root.beginSessionHold(id) }
+            onHoldEnded: function(id) { root.cancelSessionHold(id) }
+          }
+        }
 
-            Column {
-              anchors.fill: parent
-              anchors.margins: Style.space(9)
-              spacing: Style.space(9)
+        SectionCard {
+          width: parent.width
+          title: "BATTERY DETAIL"
+          summary: root.statsLoaded ? Math.round(root.healthPercent) + "% health" : ""
+          visible: root.statsLoaded
+          expanded: root.detailOpen
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          onToggled: root.detailOpen = !root.detailOpen
 
-              DetailTabs {
-                id: detailTabs
-                width: parent.width
-                current: root.detailTab
-                onSelected: function(index) { root.detailTab = index }
-              }
+          Column {
+            visible: root.statsLoaded
+            width: parent.width
+            spacing: Style.space(6)
 
-              // Every tab holds six rows, so the card height is fixed and
-              // switching tabs never moves anything else on the page.
-              Item {
-                id: detailBody
-                width: parent.width
-                height: detailHealth.implicitHeight
+            Rectangle {
+              width: parent.width
+              height: detailTabs.height + detailBody.height + Style.space(27)
+              // Inset-grouped corner radius: 10 pt at 17 pt body, 0.588 here.
+              radius: Style.cornerRadius > 0 ? Math.min(6, Style.cornerRadius) : 6
+              color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.03)
+              border.width: 1
+              border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
 
-                Column {
-                  id: detailHealth
-                  anchors.fill: parent
-                  visible: root.detailTab === 0
-                  spacing: 0
+              Column {
+                anchors.fill: parent
+                anchors.margins: Style.space(9)
+                spacing: Style.space(9)
 
-                  DetailRow { label: "Maximum capacity"; value: root.healthPercent >= 0 ? root.healthPercent.toFixed(1) + "%" : "—" }
-                  DetailRow { label: "Condition"; value: root.healthGrade !== "" ? root.healthGrade : "—" }
-                  DetailRow { label: "Wear"; value: Model.formatEnergy(Model.wear(root.statsInfo.energy_full, root.statsInfo.energy_full_design), root.energyUnit) }
-                  DetailRow { label: "Cycle count"; value: Model.formatCount(root.statsInfo.cycle_count) }
-                  DetailRow { label: "Kernel health"; value: root.statsInfo.health || "—" }
-                  DetailRow { label: "Capacity level"; value: root.statsInfo.capacity_level || "—"; showDivider: false }
+                DetailTabs {
+                  id: detailTabs
+                  width: parent.width
+                  current: root.detailTab
+                  onSelected: function(index) { root.detailTab = index }
                 }
 
-                Column {
-                  id: detailPower
-                  anchors.fill: parent
-                  visible: root.detailTab === 1
-                  spacing: 0
+                // Every tab holds six rows, so the card height is fixed and
+                // switching tabs never moves anything else on the page.
+                Item {
+                  id: detailBody
+                  width: parent.width
+                  height: detailHealth.implicitHeight
 
-                  DetailRow { label: "Energy now"; value: Model.formatEnergy(root.statsInfo.energy_now, root.energyUnit) }
-                  DetailRow { label: "Charge rate"; value: Model.formatWatts(root.statsInfo.power_now) }
-                  DetailRow { label: "Current"; value: Model.formatAmps(root.statsInfo.current_now) }
-                  DetailRow { label: "Voltage"; value: Model.formatVolts(root.statsInfo.voltage_now) }
-                  DetailRow { label: "Temperature"; value: Model.formatCelsius(root.statsInfo.temp_c) }
-                  DetailRow { label: "Time left"; value: root.timeRemainingText !== "" ? root.timeRemainingText : "—"; showDivider: false }
-                }
+                  Column {
+                    id: detailHealth
+                    anchors.fill: parent
+                    visible: root.detailTab === 0
+                    spacing: 0
 
-                Column {
-                  id: detailSpecs
-                  anchors.fill: parent
-                  visible: root.detailTab === 2
-                  spacing: 0
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Maximum capacity"; value: root.healthPercent >= 0 ? root.healthPercent.toFixed(1) + "%" : "—" }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Condition"; value: root.healthGrade !== "" ? root.healthGrade : "—" }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Wear"; value: Model.formatEnergy(Model.wear(root.statsInfo.energy_full, root.statsInfo.energy_full_design), root.energyUnit) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Cycle count"; value: Model.formatCount(root.statsInfo.cycle_count) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Kernel health"; value: root.statsInfo.health || "—" }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Capacity level"; value: root.statsInfo.capacity_level || "—"; showDivider: false }
+                  }
 
-                  DetailRow { label: "Vendor / model"; value: Model.deviceName(root.statsInfo.manufacturer, root.statsInfo.model) }
-                  DetailRow { label: "Cell type"; value: root.statsInfo.technology || "—" }
-                  DetailRow { label: "Serial"; value: root.statsInfo.serial || "—" }
-                  DetailRow { label: "Design capacity"; value: Model.formatEnergy(root.statsInfo.energy_full_design, root.energyUnit) }
-                  DetailRow { label: "Charge threshold"; value: Model.limitModeLabel(root.statsInfo.threshold_start, root.statsInfo.threshold_end) }
-                  DetailRow { label: "sysfs"; value: Model.pathBase(root.statsInfo.path); showDivider: false }
+                  Column {
+                    id: detailPower
+                    anchors.fill: parent
+                    visible: root.detailTab === 1
+                    spacing: 0
+
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Energy now"; value: Model.formatEnergy(root.statsInfo.energy_now, root.energyUnit) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Charge rate"; value: Model.formatWatts(root.statsInfo.power_now) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Current"; value: Model.formatAmps(root.statsInfo.current_now) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Voltage"; value: Model.formatVolts(root.statsInfo.voltage_now) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Temperature"; value: Model.formatCelsius(root.statsInfo.temp_c) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Time left"; value: root.timeRemainingText !== "" ? root.timeRemainingText : "—"; showDivider: false }
+                  }
+
+                  Column {
+                    id: detailSpecs
+                    anchors.fill: parent
+                    visible: root.detailTab === 2
+                    spacing: 0
+
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Vendor / model"; value: Model.deviceName(root.statsInfo.manufacturer, root.statsInfo.model) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Cell type"; value: root.statsInfo.technology || "—" }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Serial"; value: root.statsInfo.serial || "—" }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Design capacity"; value: Model.formatEnergy(root.statsInfo.energy_full_design, root.energyUnit) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "Charge threshold"; value: Model.limitModeLabel(root.statsInfo.threshold_start, root.statsInfo.threshold_end) }
+                    DetailRow { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily; label: "sysfs"; value: Model.pathBase(root.statsInfo.path); showDivider: false }
+                  }
                 }
               }
             }
           }
         }
 
-        // ---------- Options ----------
-        Column {
+        SectionCard {
           width: parent.width
-          spacing: Style.space(6)
+          title: "CONNECTED DEVICES"
+          summary: root.deviceList.length === 0 ? "None"
+            : root.deviceList.length + (root.deviceList.length === 1 ? " device" : " devices")
+          expanded: root.devicesOpen
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          onToggled: root.devicesOpen = !root.devicesOpen
 
-          PanelSectionHeader {
-            text: "OPTIONS"
+          ConnectedDevices {
+            width: parent.width
+            devices: root.deviceList
+            expandedId: root.expandedDevice
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            greenColor: root.appleGreen
+            redColor: root.appleRed
+            redBelow: root.redBatteryThreshold
+            onToggled: function(id) {
+              root.expandedDevice = root.expandedDevice === id ? "" : id
+            }
+          }
+        }
+
+        SectionCard {
+          width: parent.width
+          title: "BATTERY USAGE"
+          summary: root.usageSummary
+          expanded: root.usageOpen
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          onToggled: root.usageOpen = !root.usageOpen
+
+          UsageCard {
+            width: parent.width
+            report: root.usageInfo
+            unavailable: root.usageUnavailable
+            selectedDate: root.usageDay
+            onDaySelected: function(date) { root.selectUsageDay(date) }
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            accentColor: root.appleBlue
+            greenColor: root.appleGreen
+            yellowColor: root.appleYellow
+            redColor: root.appleRed
+          }
+        }
+
+        SectionCard {
+          width: parent.width
+          title: "USAGE BY APP"
+          summary: root.usageAppList.length > 0 ? root.usageAppList.length + " apps"
+            : (root.showingPastDay ? "Not recorded" : "")
+          // No rows and no explanation means there is nothing to open.
+          visible: root.usageAppList.length > 0 || root.usageAppsNote !== ""
+          expanded: root.appsOpen
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          onToggled: root.appsOpen = !root.appsOpen
+
+          UsageAppList {
+            width: parent.width
+            apps: root.usageAppList
+            note: root.usageAppsNote
             foreground: root.bar.foreground
             fontFamily: root.bar.fontFamily
           }
+        }
 
-          OptionRow {
-            label: "Percentage inside battery"
-            Row {
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(6)
+        SectionCard {
+          width: parent.width
+          title: "OPTIONS"
+          expanded: root.optionsOpen
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          onToggled: root.optionsOpen = !root.optionsOpen
 
-              ToggleSwitch {
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
+            OptionRow {
+              label: "Percentage inside battery"
+              Row {
                 anchors.verticalCenter: parent.verticalCenter
-                checked: root.showPercentage
-                foreground: root.bar.foreground
-                accent: Commons.Color.accent
-                onToggled: root.togglePercentage()
+                spacing: Style.space(6)
+
+                ToggleSwitch {
+                  anchors.verticalCenter: parent.verticalCenter
+                  checked: root.showPercentage
+                  foreground: root.bar.foreground
+                  accent: Commons.Color.accent
+                  onToggled: root.togglePercentage()
+                }
               }
             }
-          }
 
-          OptionRow {
-            label: "iOS 27 borderless body"
-            Row {
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(6)
-
-              ToggleSwitch {
+            OptionRow {
+              label: "iOS 27 borderless body"
+              Row {
                 anchors.verticalCenter: parent.verticalCenter
-                checked: root.borderlessStyle
-                foreground: root.bar.foreground
-                accent: Commons.Color.accent
-                onToggled: root.updateSetting("borderless", !root.borderlessStyle)
+                spacing: Style.space(6)
+
+                ToggleSwitch {
+                  anchors.verticalCenter: parent.verticalCenter
+                  checked: root.borderlessStyle
+                  foreground: root.bar.foreground
+                  accent: Commons.Color.accent
+                  onToggled: root.updateSetting("borderless", !root.borderlessStyle)
+                }
               }
             }
-          }
 
-          OptionRow {
-            label: "Icon height"
-            Row {
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(6)
-
-              Button {
+            OptionRow {
+              label: "Icon height"
+              Row {
                 anchors.verticalCenter: parent.verticalCenter
-                text: root.barIconHeight + "px"
-                fontSize: Style.font.caption
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
-                horizontalPadding: Style.space(8)
-                verticalPadding: Style.space(2)
-                bordered: true
-                onClicked: root.updateSetting("iconSize", Model.cycleSetting("iconSize", root.barIconHeight))
+                spacing: Style.space(6)
+
+                Button {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: root.barIconHeight + "px"
+                  fontSize: Style.font.caption
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  horizontalPadding: Style.space(8)
+                  verticalPadding: Style.space(2)
+                  bordered: true
+                  onClicked: root.updateSetting("iconSize", Model.cycleSetting("iconSize", root.barIconHeight))
+                }
               }
             }
-          }
 
-          OptionRow {
-            label: "Turn red below"
-            Row {
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(6)
-
-              NumberField {
+            OptionRow {
+              label: "Turn red below"
+              Row {
                 anchors.verticalCenter: parent.verticalCenter
-                settingKey: "redThreshold"
-                value: root.redBatteryThreshold
-                minimum: Model.settingRange("redThreshold").min
-                maximum: Model.settingRange("redThreshold").max
-                onCommitted: function(next) { root.updateSetting("redThreshold", next) }
+                spacing: Style.space(6)
+
+                NumberField {
+                  anchors.verticalCenter: parent.verticalCenter
+                  settingKey: "redThreshold"
+                  value: root.redBatteryThreshold
+                  minimum: Model.settingRange("redThreshold").min
+                  maximum: Model.settingRange("redThreshold").max
+                  onCommitted: function(next) { root.updateSetting("redThreshold", next) }
+                }
               }
             }
-          }
 
-          OptionRow {
-            label: "Auto power-saver at"
-            Row {
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(6)
-
-              NumberField {
+            OptionRow {
+              label: "Auto power-saver"
+              Row {
                 anchors.verticalCenter: parent.verticalCenter
-                settingKey: "powerSaverThreshold"
-                value: root.powerSaverThreshold
-                minimum: Model.settingRange("powerSaverThreshold").min
-                maximum: Model.settingRange("powerSaverThreshold").max
-                alert: root.autoSaverEngaged
-                onCommitted: function(next) { root.updateSetting("powerSaverThreshold", next) }
+                spacing: Style.space(6)
+
+                ToggleSwitch {
+                  anchors.verticalCenter: parent.verticalCenter
+                  checked: root.autoPowerSaver
+                  foreground: root.bar.foreground
+                  accent: Commons.Color.accent
+                  onToggled: root.updateSetting("autoPowerSaver", !root.autoPowerSaver)
+                }
+              }
+            }
+
+            OptionRow {
+              label: "Auto power-saver at"
+              enabled: root.autoPowerSaver
+              opacity: root.autoPowerSaver ? 1.0 : 0.45
+              Row {
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(6)
+
+                NumberField {
+                  anchors.verticalCenter: parent.verticalCenter
+                  settingKey: "powerSaverThreshold"
+                  value: root.powerSaverThreshold
+                  minimum: Model.settingRange("powerSaverThreshold").min
+                  maximum: Model.settingRange("powerSaverThreshold").max
+                  alert: root.autoSaverEngaged
+                  onCommitted: function(next) { root.updateSetting("powerSaverThreshold", next) }
+                }
               }
             }
           }
         }
+      }
+
+      // Transparent key layer above the dashboard. It claims only the session
+      // hold keys; every other key falls through to PanelKeyCatcher above.
+      HoldKeys {
+        id: holdKeys
+        anchors.fill: parent
+        actions: root.sessionActions
+        onHoldStarted: function(id) { root.beginSessionHold(id) }
+        onHoldEnded: function(id) { root.cancelSessionHold(id) }
+        onHorizontalMove: function(direction) { root.moveProfileHorizontal(direction) }
       }
     }
   }
@@ -1310,64 +1729,6 @@ Panel {
           }
         }
       }
-    }
-  }
-
-  // One real row of the detail card: label left, value right, hairline
-  // separator underneath. Fixed height keeps the three tabs interchangeable,
-  // and missing hardware attributes print "—" instead of collapsing a row.
-  component DetailRow: Item {
-    id: row
-    property string label: ""
-    property string value: ""
-    property bool showDivider: true
-
-    width: parent ? parent.width : 0
-    // UITableView's default 44 pt row at this card's 0.588 scale.
-    height: Style.space(26)
-
-    // The label takes exactly the width its glyphs need and is never elided:
-    // a caption cut to "Charge thresho…" is a defect, not a layout trade-off.
-    Text {
-      id: rowLabel
-      anchors.left: parent.left
-      anchors.verticalCenter: parent.verticalCenter
-      width: implicitWidth
-      textFormat: Text.PlainText
-      text: row.label
-      color: root.bar.foreground
-      opacity: 0.62
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.caption
-      elide: Text.ElideNone
-    }
-
-    // The value gets the rest of the row and is never elided either; the
-    // strings in the three tabs are short enough to fit that width whole.
-    Text {
-      id: rowValue
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      width: Math.max(0, parent.width - rowLabel.width - Style.space(8))
-      textFormat: Text.PlainText
-      text: row.value
-      horizontalAlignment: Text.AlignRight
-      elide: Text.ElideNone
-      color: root.bar.foreground
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.caption
-    }
-
-    Rectangle {
-      visible: row.showDivider
-      // UIKit starts a list separator at the text's leading edge (16 pt at
-      // 17 pt body, 9 pt here), not at the card edge.
-      anchors.left: parent.left
-      anchors.leftMargin: Style.space(9)
-      anchors.right: parent.right
-      anchors.bottom: parent.bottom
-      height: 1
-      color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
     }
   }
 }

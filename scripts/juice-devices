@@ -1,0 +1,608 @@
+#!/usr/bin/env bash
+# Juice — read-only connected-battery probe.
+#
+# Prints one JSON array: the laptop pack, UPower battery peripherals, connected
+# BlueZ devices, and USB HID receivers that plausibly carry a battery. A USB
+# dongle is recognised by the wireless claim its HID nodes report (HID_NAME and
+# input device names), not by the USB product descriptor, which often says only
+# "USB Composite Device". A device with no reported level is kept with level -1
+# so the panel can say "Not reported" instead of dropping it. Hubs, line power
+# and USB-C source nodes are not devices and stay out. Values come from UPower,
+# BlueZ and sysfs/udev; nothing is invented, and a missing attribute stays
+# missing.
+#
+# Sources, in order of precedence for the numeric level:
+#   upower -d              → level, state, model/vendor/serial, health, energy
+#   bluetoothctl info      → BlueZ Device1 props (address, class, icon, linkage)
+#   /sys/class/power_supply → type/scope/status/bus for HID nodes
+#   udevadm info           → ID_BUS/ID_MODEL/ID_VENDOR for USB receivers
+#
+# Env overrides exist for tests: JUICE_UPOWER_DUMP (fixture file),
+# JUICE_BLUETOOTH_INFO_DIR (dir of <address>.txt fixtures), JUICE_SYSFS_ROOT.
+
+set -euo pipefail
+shopt -s extglob
+export LC_ALL=C
+
+POWER_SUPPLY="${JUICE_SYSFS_ROOT:-/sys}/class/power_supply"
+USB_DEVICES="${JUICE_SYSFS_ROOT:-/sys}/bus/usb/devices"
+UPOWER_DUMP="${JUICE_UPOWER_DUMP:-}"
+BT_INFO_DIR="${JUICE_BLUETOOTH_INFO_DIR:-}"
+
+# ---------------------------------------------------------------- helpers ---
+
+# Number or -1 when the attribute is absent/unparseable, so the panel can tell
+# "0%" apart from "not reported".
+jnum() {
+  local raw="${1:-}"
+  raw="${raw%%\%}"
+  raw="${raw%% *}"
+  if [[ $raw =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then printf '%s' "$raw"; else printf '%s' '-1'; fi
+}
+
+trim() {
+  local s="${1:-}"
+  s="${s##+([[:space:]])}"
+  s="${s%%+([[:space:]])}"
+  printf '%s' "$s"
+}
+
+jbool() {
+  case "${1:-}" in
+    yes | true | 1) printf 'true' ;;
+    no | false | 0) printf 'false' ;;
+    *) printf 'null' ;;
+  esac
+}
+
+# UPower prints "updated: Thu 22 Oct 2026 11:26:13 AM IST (82 seconds ago)".
+# The age is the only machine-readable part, and it is the true "last report".
+# Longer gaps come back as "1 hour, 3 minutes, 2 seconds ago", so every unit
+# token is summed instead of assuming seconds.
+age_seconds() {
+  local raw="${1:-}"
+  [[ $raw == *"("*"ago)"* ]] || { printf '%s' '-1'; return 0; }
+  local inside="${raw#*\(}"
+  inside="${inside%ago\)*}"
+  local total=0 found=0 n unit
+  while read -r n unit; do
+    [[ -n $n && -n $unit ]] || continue
+    found=1
+    case "$unit" in
+      hour* | hours*) total=$((total + n * 3600)) ;;
+      minute* | minutes*) total=$((total + n * 60)) ;;
+      second* | seconds*) total=$((total + n)) ;;
+    esac
+  done < <(printf '%s\n' "$inside" | tr ',' '\n' | awk '{ if ($1 ~ /^[0-9]+$/) print $1, $2 }')
+  if [[ $found -eq 1 ]]; then printf '%s' "$total"; else printf '%s' '-1'; fi
+}
+
+# UPower time estimates read "2.3 hours" / "45.0 minutes"; the rest of the JSON
+# contract keeps times in whole seconds.
+jsecs() {
+  local raw="${1:-}"
+  [[ -n $raw ]] || { printf '%s' '-1'; return 0; }
+  local n unit
+  n="$(printf '%s' "$raw" | awk '{print $1}')"
+  unit="$(printf '%s' "$raw" | awk '{print $2}')"
+  [[ $n =~ ^[0-9]+([.][0-9]+)?$ ]] || { printf '%s' '-1'; return 0; }
+  case "$unit" in
+    hour* | hours*) awk -v n="$n" 'BEGIN { printf "%d", n * 3600 }' ;;
+    minute* | minutes*) awk -v n="$n" 'BEGIN { printf "%d", n * 60 }' ;;
+    second* | seconds*) awk -v n="$n" 'BEGIN { printf "%d", n }' ;;
+    *) printf '%s' '-1' ;;
+  esac
+}
+
+# BlueZ native paths carry the address as dev_XX_XX_..
+bluez_address() {
+  local path="${1:-}"
+  [[ $path == /org/bluez/* ]] || return 0
+  local tail="${path##*/}"
+  [[ $tail == dev_* ]] || return 0
+  printf '%s' "${tail#dev_}" | tr '_' ':'
+}
+
+# BlueZ Device1 properties, from a fixture file when one is supplied and from
+# bluetoothctl otherwise. The values are read into globals because both the
+# UPower path and the BlueZ-only path build the same row from them.
+bt_name="" bt_icon="" bt_class="" bt_connected="" bt_paired=""
+bt_trusted="" bt_rssi="" bt_txpower="" bt_modalias="" bt_battery=""
+
+read_bt_props() {
+  local address="${1:-}" raw="${2:-}" bt=""
+  bt_name="" bt_icon="" bt_class="" bt_connected="" bt_paired=""
+  bt_trusted="" bt_rssi="" bt_txpower="" bt_modalias="" bt_battery=""
+  [[ -n $address ]] || return 0
+
+  if [[ -n $raw ]]; then
+    bt="$raw"
+  elif [[ -n $BT_INFO_DIR ]]; then
+    [[ -r $BT_INFO_DIR/$address.txt ]] && bt="$(cat "$BT_INFO_DIR/$address.txt")"
+  elif command -v bluetoothctl >/dev/null 2>&1; then
+    # stdin must not be the dump being read: bluetoothctl runs a REPL and would
+    # swallow every device after this one.
+    bt="$(bluetoothctl info "$address" </dev/null 2>/dev/null || true)"
+  fi
+
+  [[ -n $bt ]] || return 0
+  local line key val
+  while IFS= read -r line; do
+    line="${line#$'\t'}"
+    [[ $line == *": "* ]] || continue
+    key="${line%%:*}"
+    val="${line#*: }"
+    case "$key" in
+      Name) bt_name="$val" ;;
+      Icon) bt_icon="$val" ;;
+      Class) bt_class="${val%% *}" ;;
+      Connected) bt_connected="$val" ;;
+      Paired) bt_paired="$val" ;;
+      Trusted) bt_trusted="$val" ;;
+      RSSI) bt_rssi="$val" ;;
+      TxPower) bt_txpower="$val" ;;
+      Modalias) bt_modalias="$val" ;;
+      "Battery Percentage")
+        # "0x50 (80)" — the decimal in parentheses is the percentage.
+        if [[ $val =~ \(([0-9]+)\) ]]; then bt_battery="${BASH_REMATCH[1]}"; fi
+        ;;
+    esac
+  done <<<"$bt"
+}
+
+# --------------------------------------------------------------- parsing ---
+
+declare -A props=()
+declare -A attrs=()
+device=""
+kind=""
+
+emit_device() {
+  # A peripheral with no percentage is still a connected device: it is emitted
+  # with level -1 so the panel can say "Not reported" instead of dropping it.
+  # line-power and DisplayDevice never reach this function.
+  local pct="${attrs[percentage]:-}" state="${attrs[state]:-}"
+  local native="${props[native-path]:-}"
+  local address
+  address="$(bluez_address "$native")"
+  read_bt_props "$address"
+
+  # ---- kernel power_supply node, for HID/USB devices -----------------------
+  local node="${native##*/}"
+  local sys_dir="" sys_type="" sys_scope="" sys_status="" sys_bus=""
+  local sys_model="" sys_vendor="" sys_serial=""
+  if [[ -n $node && -d $POWER_SUPPLY/$node ]]; then
+    sys_dir="$POWER_SUPPLY/$node"
+    for f in type scope status model_name manufacturer serial_number; do
+      [[ -r $sys_dir/$f ]] || continue
+      case "$f" in
+        type) sys_type="$(tr -d '\r\n' <"$sys_dir/$f")" ;;
+        scope) sys_scope="$(tr -d '\r\n' <"$sys_dir/$f")" ;;
+        # "Not charging" is one value, not two: the panel compares the words.
+        status) sys_status="$(tr -d '\r\n' <"$sys_dir/$f")" ;;
+        model_name) sys_model="$(tr -d '\r\n' <"$sys_dir/$f")" ;;
+        manufacturer) sys_vendor="$(tr -d '\r\n' <"$sys_dir/$f")" ;;
+        serial_number) sys_serial="$(tr -d '[:space:]' <"$sys_dir/$f")" ;;
+      esac
+    done
+    if command -v udevadm >/dev/null 2>&1; then
+      local udev
+      udev="$(udevadm info --query=property --path="$sys_dir" </dev/null 2>/dev/null || true)"
+      while IFS= read -r line; do
+        case "$line" in
+          ID_BUS=*) sys_bus="${line#ID_BUS=}" ;;
+        esac
+      done <<<"$udev"
+    fi
+  fi
+
+  # Model wins over the address BlueZ would otherwise show, so the row reads
+  # "Rockerz 650 Pro", not "24:DF:17:08:2D:14".
+  local name="${bt_name:-${props[model]:-${sys_model:-}}}"
+  if [[ -z $name ]]; then
+    if [[ -n $address ]]; then name="$address"; else name="${node:-Battery}"; fi
+  fi
+
+  local id
+  if [[ -n $address ]]; then
+    id="bluez:$address"
+  elif [[ -n $sys_dir ]]; then
+    id="sysfs:$node"
+  else
+    id="upower:$native"
+  fi
+
+  jq -cn \
+    --arg id "$id" \
+    --arg name "$name" \
+    --arg kind "${kind:-unknown}" \
+    --arg native "$native" \
+    --arg vendor "${props[vendor]:-${sys_vendor:-}}" \
+    --arg model "${props[model]:-${sys_model:-}}" \
+    --arg serial "${props[serial]:-${sys_serial:-}}" \
+    --arg technology "${attrs[technology]:-}" \
+    --arg state "$state" \
+    --arg warning "${attrs[warning-level]:-}" \
+    --arg status "${attrs[status]:-}" \
+    --arg icon "${attrs[icon-name]//\'/}" \
+    --arg updated_age "$(age_seconds "${props[updated]:-}")" \
+    --arg level "$(jnum "${pct:-${bt_battery:-}}")" \
+    --arg capacity "$(jnum "${attrs[capacity]:-}")" \
+    --arg cycles "$(jnum "${attrs[charge-cycles]:-}")" \
+    --arg temperature "$(jnum "${attrs[temperature]:-}")" \
+    --arg energy "$(jnum "${attrs[energy]:-}")" \
+    --arg energy_full "$(jnum "${attrs[energy-full]:-}")" \
+    --arg energy_full_design "$(jnum "${attrs[energy-full-design]:-}")" \
+    --arg energy_rate "$(jnum "${attrs[energy-rate]:-}")" \
+    --arg voltage "$(jnum "${attrs[voltage]:-}")" \
+    --arg time_to_empty "$(jsecs "${attrs[time-to-empty]:-}")" \
+    --arg time_to_full "$(jsecs "${attrs[time-to-full]:-}")" \
+    --argjson present "$(jbool "${attrs[present]:-${props[present]:-}}")" \
+    --argjson rechargeable "$(jbool "${attrs[rechargeable]:-}")" \
+    --argjson has_history "$(jbool "${props[has history]:-}")" \
+    --argjson has_statistics "$(jbool "${props[has statistics]:-}")" \
+    --argjson power_supply "$(jbool "${props[power supply]:-}")" \
+    --arg bt_address "$address" \
+    --arg bt_icon "$bt_icon" \
+    --arg bt_class "$bt_class" \
+    --argjson bt_connected "$(jbool "$bt_connected")" \
+    --argjson bt_paired "$(jbool "$bt_paired")" \
+    --argjson bt_trusted "$(jbool "$bt_trusted")" \
+    --arg bt_rssi "$(jnum "$bt_rssi")" \
+    --arg bt_txpower "$(jnum "$bt_txpower")" \
+    --arg bt_modalias "$bt_modalias" \
+    --arg bt_battery "$(jnum "$bt_battery")" \
+    --arg sys_path "$sys_dir" \
+    --arg sys_type "$sys_type" \
+    --arg sys_scope "$sys_scope" \
+    --arg sys_status "$sys_status" \
+    --arg sys_bus "$sys_bus" \
+    '{
+      id: $id,
+      name: $name,
+      kind: $kind,
+      native: $native,
+      vendor: $vendor,
+      model: $model,
+      serial: $serial,
+      technology: $technology,
+      state: $state,
+      warning: $warning,
+      status: $status,
+      icon: $icon,
+      updatedAge: ($updated_age | tonumber),
+      level: ($level | tonumber),
+      capacity: ($capacity | tonumber),
+      cycles: ($cycles | tonumber),
+      temperature: ($temperature | tonumber),
+      energy: ($energy | tonumber),
+      energyFull: ($energy_full | tonumber),
+      energyFullDesign: ($energy_full_design | tonumber),
+      energyRate: ($energy_rate | tonumber),
+      voltage: ($voltage | tonumber),
+      timeToEmpty: ($time_to_empty | tonumber),
+      timeToFull: ($time_to_full | tonumber),
+      present: $present,
+      rechargeable: $rechargeable,
+      hasHistory: $has_history,
+      hasStatistics: $has_statistics,
+      powerSupply: $power_supply,
+      bt: {
+        address: $bt_address,
+        icon: $bt_icon,
+        class: $bt_class,
+        connected: $bt_connected,
+        paired: $bt_paired,
+        trusted: $bt_trusted,
+        rssi: ($bt_rssi | tonumber),
+        txPower: ($bt_txpower | tonumber),
+        modalias: $bt_modalias,
+        battery: ($bt_battery | tonumber)
+      },
+      sys: {
+        path: $sys_path,
+        type: $sys_type,
+        scope: $sys_scope,
+        status: $sys_status,
+        bus: $sys_bus
+      }
+    }'
+}
+
+# ---------------------------------------------------------------- reading ---
+
+# Parse one `upower -i` block. Per-device text instead of one `upower -d` stream:
+# the dump interleaves device stanzas, and a single mis-parsed boundary used to
+# drop whole devices from the list.
+parse_device_text() {
+  # The stanza header names the device; the file path is only a fixture detail.
+  local header
+  header="$(printf '%s\n' "$2" | head -n 1)"
+  if [[ $header == "Device: "* ]]; then device="${header#Device: }"; else device="$1"; fi
+
+  # UPower's merged DisplayDevice is not a second battery; it mirrors the pack
+  # the panel already owns.
+  [[ $device == */DisplayDevice ]] && return 0
+  props=()
+  attrs=()
+  kind=""
+
+  local line rest key
+  mapfile -t device_lines <<<"$2"
+  for line in "${device_lines[@]}"; do
+    case "$line" in "Device: "*) continue ;; esac
+
+    # Indentation is the only structure UPower's text has: two spaces are device
+    # properties, four are the type block's attributes, and a bare two-space word
+    # opens that block. Pad-stripping by hand keeps names with inner spaces
+    # ("has history") intact instead of letting the padding leak into the key.
+    if [[ $line == "    "* ]]; then
+      rest="${line#    }"
+      [[ $rest == *": "* ]] || continue
+      attrs["$(trim "${rest%%:*}")"]="$(trim "${rest#*: }")"
+      continue
+    fi
+
+    if [[ $line == "  "* ]]; then
+      rest="${line#  }"
+      if [[ $rest == *": "* ]]; then
+        key="$(trim "${rest%%:*}")"
+        [[ -z $kind ]] && props["$key"]="$(trim "${rest#*: }")"
+        continue
+      fi
+      rest="$(trim "$rest")"
+      if [[ $rest =~ ^[a-z][a-z-]*$ ]]; then
+        kind="$rest"
+        continue
+      fi
+    fi
+  done
+
+  [[ $kind == line-power ]] && return 0
+  # The laptop pack is not a connected device. The panel's hero carries its
+  # level and its state, and BATTERY DETAIL carries its health, energy and
+  # vendor data, so listing it here printed the same charge a third time.
+  # The rule covers every internal pack (BAT0, BAT1, …): these belong to the
+  # machine, not to the set of things plugged into it.
+  [[ $kind == battery ]] && return 0
+  emit_device
+}
+
+emit_all() {
+  local info path
+
+  if [[ -n $UPOWER_DUMP ]]; then
+    [[ -r $UPOWER_DUMP ]] || return 0
+    # A fixture is a whole `upower -d` dump; split it on the stanza header so the
+    # same per-device parser runs against real and recorded input alike.
+    local dir
+    dir="$(mktemp -d)"
+    awk -v dir="$dir" '
+      /^Device: / { n++; file = dir "/device" n ".info" }
+      file != "" { print > file }
+    ' "$UPOWER_DUMP"
+    for path in "$dir"/*.info; do
+      [[ -r $path ]] || continue
+      info="$(cat "$path")"
+      parse_device_text "${path}" "$info"
+    done
+    rm -rf "$dir"
+    return 0
+  fi
+
+  command -v upower >/dev/null 2>&1 || return 0
+  mapfile -t paths <<<"$(upower -e 2>/dev/null || true)"
+  for path in "${paths[@]}"; do
+    [[ -n $path ]] || continue
+    [[ $path == */DisplayDevice ]] && continue
+    info="$(upower -i "$path" </dev/null 2>/dev/null || true)"
+    [[ -n $info ]] || continue
+    parse_device_text "$path" "$info"
+  done
+}
+
+# BlueZ keeps connected devices that UPower does not expose. Only connected
+# ones are listed: a paired headset that is switched off is not attached.
+emit_bluez_extras() {
+  local address info file line
+
+  if [[ -n $BT_INFO_DIR ]]; then
+    for file in "$BT_INFO_DIR"/*.txt; do
+      [[ -r $file ]] || continue
+      address="$(basename "$file" .txt)"
+      emit_bt_entry "$address" "$(cat "$file")"
+    done
+    return 0
+  fi
+
+  # Fixture dumps stay deterministic; only the live probe asks BlueZ.
+  [[ -z $UPOWER_DUMP ]] || return 0
+  command -v bluetoothctl >/dev/null 2>&1 || return 0
+  while IFS= read -r line; do
+    [[ $line == Device\ * ]] || continue
+    address="${line#Device }"
+    address="${address%% *}"
+    info="$(bluetoothctl info "$address" </dev/null 2>/dev/null || true)"
+    emit_bt_entry "$address" "$info"
+  done < <(bluetoothctl devices Connected </dev/null 2>/dev/null || true)
+}
+
+bt_kind() {
+  case "${bt_icon:-}" in
+    audio-headset | audio-headphones) printf 'headset' ;;
+    input-mouse) printf 'mouse' ;;
+    input-keyboard) printf 'keyboard' ;;
+    input-gaming) printf 'gaming-input' ;;
+    phone) printf 'phone' ;;
+    *) printf 'device' ;;
+  esac
+}
+
+emit_bt_entry() {
+  local address="$1" raw="${2:-}" name kind level
+  read_bt_props "$address" "$raw"
+  [[ $bt_connected == "yes" ]] || return 0
+
+  kind="$(bt_kind)"
+  name="${bt_name:-$address}"
+  level="$(jnum "${bt_battery:-}")"
+
+  jq -cn \
+    --arg id "bluez:$address" \
+    --arg name "$name" \
+    --arg kind "$kind" \
+    --arg address "$address" \
+    --arg icon "$bt_icon" \
+    --arg class "$bt_class" \
+    --arg modalias "$bt_modalias" \
+    --arg level "$level" \
+    --arg rssi "$(jnum "$bt_rssi")" \
+    --arg txpower "$(jnum "$bt_txpower")" \
+    --arg battery "$(jnum "$bt_battery")" \
+    --argjson paired "$(jbool "$bt_paired")" \
+    --argjson trusted "$(jbool "$bt_trusted")" \
+    '{
+      id: $id, name: $name, kind: $kind, native: "", vendor: "", model: $name,
+      serial: $address, level: ($level | tonumber), updatedAge: -1,
+      bt: {
+        address: $address, icon: $icon, class: $class, connected: true,
+        paired: $paired, trusted: $trusted,
+        rssi: ($rssi | tonumber), txPower: ($txpower | tonumber),
+        modalias: $modalias, battery: ($battery | tonumber)
+      },
+      sys: {path: "", type: "", scope: "", status: "", bus: ""}
+    }'
+}
+
+# A power_supply node whose device link points at this USB device already
+# reports its battery; adding the receiver too would duplicate one product.
+power_supply_covers() {
+  local dev_real node_real node
+  dev_real="$(readlink -f "$1" 2>/dev/null)" || return 1
+  for node in "$POWER_SUPPLY"/*/device; do
+    [[ -e $node ]] || continue
+    node_real="$(readlink -f "$node" 2>/dev/null)" || continue
+    [[ $node_real == "$dev_real"/* ]] && return 0
+  done
+  return 1
+}
+
+usb_kind() {
+  local kind="" name lower
+  for name in "$1"/*/*/input/input*/name; do
+    [[ -r $name ]] || continue
+    lower="$(tr '[:upper:]' '[:lower:]' <"$name")"
+    case "$lower" in
+      *keyboard*) kind="keyboard" ;;
+      *mouse* | *touchpad*) [[ $kind != keyboard ]] && kind="mouse" ;;
+      *gamepad* | *joystick*) [[ -z $kind ]] && kind="gaming-input" ;;
+    esac
+  done
+  printf '%s' "${kind:-receiver}"
+}
+
+usb_vendor() {
+  local vendor
+  vendor="$(trim "$(cat "$1/manufacturer" 2>/dev/null || true)")"
+  if [[ -z $vendor ]] && command -v udevadm >/dev/null 2>&1; then
+    vendor="$(udevadm info --query=property --path="$1" </dev/null 2>/dev/null \
+      | sed -n 's/^ID_VENDOR_FROM_DATABASE=//p' | head -n 1)"
+  fi
+  printf '%s' "$vendor"
+}
+
+# A wireless claim anywhere in the names the HID side reports. The USB product
+# descriptor is the weakest of those: a receiver often enumerates as "USB
+# Composite Device" while its HID node and input devices name themselves.
+wireless_claim() {
+  local lower="${1,,}"
+  [[ $lower == *wireless* || $lower == *receiver* || $lower == *dongle* \
+    || $lower == *unifying* || $lower == *2.4g* ]]
+}
+
+# Every name the HID nodes under this USB device report: the HID_NAME in each
+# node's uevent and the name of every input device it created.
+usb_hid_names() {
+  local hid line input
+  for hid in "$1"/*/0003:*; do
+    [[ -d $hid ]] || continue
+    if [[ -r $hid/uevent ]]; then
+      while IFS= read -r line; do
+        [[ $line == HID_NAME=* ]] && printf '%s\n' "$(trim "${line#HID_NAME=}")"
+      done <"$hid/uevent"
+    fi
+    for input in "$hid"/input/input*/name; do
+      [[ -r $input ]] && printf '%s\n' "$(trim "$(cat "$input")")"
+    done
+  done
+}
+
+# USB HID receivers announce a wireless link but often expose no battery node.
+# The claim is read from the HID nodes' own names, not the product descriptor, so
+# a dongle that calls itself "USB Composite Device" is still listed. Hubs, wired
+# keyboards, cameras and the Bluetooth radio never make a claim and stay out.
+emit_usb_extras() {
+  [[ -d $USB_DEVICES ]] || return 0
+  local dev base product intf hid kind vendor serial line claim
+
+  for dev in "$USB_DEVICES"/*; do
+    [[ -d $dev ]] || continue
+    base="${dev##*/}"
+    [[ $base == *:* ]] && continue
+    [[ -r $dev/bDeviceClass ]] || continue
+    [[ "$(cat "$dev/bDeviceClass" 2>/dev/null)" == "09" ]] && continue
+
+    hid=0
+    for intf in "$dev"/*:*; do
+      [[ -r $intf/bInterfaceClass ]] || continue
+      [[ "$(cat "$intf/bInterfaceClass" 2>/dev/null)" == "03" ]] && hid=1
+    done
+    [[ $hid -eq 1 ]] || continue
+
+    product="$(trim "$(cat "$dev/product" 2>/dev/null || true)")"
+    claim=""
+    if wireless_claim "$product"; then
+      claim="$product"
+    else
+      # The shortest claiming name is the product's own model name, not one of
+      # its per-interface suffixes ("... Consumer Control", "... Keyboard").
+      while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        wireless_claim "$line" || continue
+        [[ -z $claim || ${#line} -lt ${#claim} ]] && claim="$line"
+      done < <(usb_hid_names "$dev")
+    fi
+    [[ -n $claim ]] || continue
+    if power_supply_covers "$dev"; then continue; fi
+
+    kind="$(usb_kind "$dev")"
+    vendor="$(usb_vendor "$dev")"
+    serial="$(trim "$(cat "$dev/serial" 2>/dev/null || true)")"
+
+    jq -cn \
+      --arg id "usb:$base" \
+      --arg name "$claim" \
+      --arg kind "$kind" \
+      --arg vendor "$vendor" \
+      --arg serial "$serial" \
+      --arg path "$dev" \
+      '{
+        id: $id, name: $name, kind: $kind, native: "", vendor: $vendor,
+        model: $name, serial: $serial, level: -1, updatedAge: -1,
+        bt: {
+          address: "", icon: "", class: "", connected: null, paired: null,
+          trusted: null, rssi: -1, txPower: -1, modalias: "", battery: -1
+        },
+        sys: {path: $path, type: "USB", scope: "Device", status: "", bus: "usb"}
+      }'
+  done
+}
+
+{
+  emit_all
+  emit_bluez_extras
+  emit_usb_extras
+} | jq -s '
+  map(select(. != null))
+  | reduce .[] as $d ([]; if any(.[]; .id == $d.id) then . else . + [$d] end)
+'

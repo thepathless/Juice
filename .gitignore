@@ -15,3 +15,7 @@ AGENT.md
 *.swp
 *.swo
 .DS_Store
+
+# Python bytecode from the usage sampler
+__pycache__/
+*.pyc

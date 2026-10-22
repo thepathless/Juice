@@ -43,6 +43,11 @@ command -v jq >/dev/null 2>&1 || {
   exit 1
 }
 
+# Battery-usage metering is the only section that needs Python; the rest of the
+# plugin works without it, so a missing interpreter is a notice, not a failure.
+command -v python3 >/dev/null 2>&1 ||
+  printf '  python3: not found — the battery-usage card will stay unavailable\n'
+
 PLUGIN_ID="$(jq -r '.id' "$PLUGIN_DIR/manifest.json")"
 TARGET="$PLUGINS_DIR/$PLUGIN_ID"
 
@@ -130,4 +135,4 @@ fi
 
 printf '\nCurrent hardware state:\n'
 bash "$PLUGIN_DIR/scripts/juice-stats" | sed 's/^/  /'
-printf '\nDone. Open the bar widget and use "Charge to 80%%" / "Charge to 100%%".\n'
+printf '\nDone. Open the bar widget and use "80%% Limit" / "100%% Full".\n'

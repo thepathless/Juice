@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Pins the bar glyph's colour precedence. A charging pack must read green even
+# when it is below the red threshold or running in power-saver; red and yellow
+# describe states that are not receiving power.
+
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+command -v node >/dev/null || { printf 'skip: node not found\n' >&2; exit 77; }
+
+node --check "$root/Model.js"
+
+node - "$root/Model.js" <<'NODE'
+const M = require(process.argv[2])
+
+function check(label, actual, expected) {
+  if (actual !== expected) {
+    console.error(`FAIL ${label}: expected ${expected}, got ${actual}`)
+    process.exit(1)
+  }
+}
+
+const normal = "normal"
+const green = "green"
+const yellow = "yellow"
+const red = "red"
+const colour = (state, level, saver = false, threshold = 20) =>
+  M.iconColor(state, level, saver, threshold, normal, green, yellow, red)
+
+check("charging below red is green", colour("charging", 15), green)
+check("charging in power-saver is green", colour("charging", 15, true), green)
+check("full is green", colour("full", 100, true), green)
+check("plugged below red stays red", colour("plugged", 15), red)
+check("discharging in power-saver is yellow", colour("discharging", 15, true), yellow)
+check("discharging at threshold is red", colour("discharging", 20), red)
+check("discharging above threshold is normal", colour("discharging", 21), normal)
+check("absent is normal", colour("absent", 0), normal)
+
+console.log("color: ok")
+NODE

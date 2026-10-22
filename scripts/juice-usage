@@ -1,0 +1,790 @@
+#!/usr/bin/env python3
+"""Juice — battery usage sampler and report.
+
+iOS' Battery Usage screen answers three questions: how much of the pack a day
+costs, how that compares with earlier days at the same clock time, and which
+apps were responsible. Linux has no equivalent daemon, so this script meters
+the real sources directly:
+
+  * pack energy      — /sys/class/power_supply/BAT*/{energy,charge}_now
+  * level timeline   — the same pack, backfilled from UPower's own history
+  * screen on/off    — Hyprland monitor DPMS state
+  * per-app work     — /proc/<pid>/stat CPU ticks attributed to the window class
+                       that owns each process tree, plus focused-window seconds
+
+Energy is only metered while the pack is actually the power source. The share an
+app gets during discharge is its portion of the measured CPU work, so rows add
+up to the metered discharge and the remainder (idle, display, kernel) stays in
+the day total instead of being invented per app. CPU deltas and focused time are
+recorded continuously, so while charging the list adds today's activity shares
+beside any battery shares measured earlier — each row names its own basis and
+never presents a proxy as pack drain. Only a day with no measurement at all
+falls back to the last discharge, or says that nothing was measured.
+
+Subcommands: --sample (default), --daemon, --report.
+State: $XDG_STATE_HOME/juice/usage.json (override: JUICE_STATE_DIR).
+"""
+
+import fcntl
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+
+STATE_DIR = os.environ.get("JUICE_STATE_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "juice"
+)
+STATE_FILE = os.path.join(STATE_DIR, "usage.json")
+LOCK_FILE = os.path.join(STATE_DIR, "usage.lock")
+POWER_SUPPLY = os.path.join(os.environ.get("JUICE_SYSFS_ROOT", "/sys"), "class", "power_supply")
+
+SAMPLE_INTERVAL = int(os.environ.get("JUICE_SAMPLE_INTERVAL", "60"))
+# A gap longer than this is a suspend, a crash or a stopped sampler: the energy
+# that moved in between cannot be attributed to any app and is not counted.
+MAX_GAP = 900
+RETENTION_DAYS = 35
+MAX_APPS = 40
+
+
+# ------------------------------------------------------------------ sources ---
+
+
+def _read(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _number(path):
+    raw = _read(path)
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _micro(value):
+    return None if value is None else value / 1_000_000.0
+
+
+def battery_path():
+    if not os.path.isdir(POWER_SUPPLY):
+        return None
+    candidates = []
+    try:
+        for name in os.listdir(POWER_SUPPLY):
+            node = os.path.join(POWER_SUPPLY, name)
+            if _read(os.path.join(node, "type")) != "Battery":
+                continue
+            if not os.path.exists(os.path.join(node, "capacity")):
+                continue
+            candidates.append(node)
+    except OSError:
+        return None
+    # The system pack is BAT0/BAT1; peripheral HID packs use hid-*/hidpp_* names.
+    for node in candidates:
+        if os.path.basename(node).startswith("BAT"):
+            return node
+    return candidates[0] if candidates else None
+
+
+def read_battery():
+    node = battery_path()
+    if not node:
+        return None
+
+    status = _read(os.path.join(node, "status"))
+    level = _number(os.path.join(node, "capacity"))
+    # sysfs reports energy in µWh; every number downstream is Wh.
+    energy = _micro(_number(os.path.join(node, "energy_now")))
+    full = _micro(_number(os.path.join(node, "energy_full")))
+    design = _micro(_number(os.path.join(node, "energy_full_design")))
+    unit = "Wh"
+
+    if energy is None:
+        charge = _number(os.path.join(node, "charge_now"))
+        charge_full = _number(os.path.join(node, "charge_full"))
+        charge_design = _number(os.path.join(node, "charge_full_design"))
+        volts = _number(os.path.join(node, "voltage_now"))
+        volts_design = _number(os.path.join(node, "voltage_min_design"))
+        if volts is None or volts <= 0:
+            volts = volts_design
+        if charge is not None and volts and volts > 0:
+            scale = volts / 1_000_000.0
+            energy = (charge / 1_000_000.0) * scale
+            full = (charge_full / 1_000_000.0) * scale if charge_full else None
+            design = (charge_design / 1_000_000.0) * scale if charge_design else None
+            unit = "Ah"
+
+    on_battery = True
+    try:
+        for name in os.listdir(POWER_SUPPLY):
+            if _read(os.path.join(POWER_SUPPLY, name, "type")) != "Mains":
+                continue
+            if _read(os.path.join(POWER_SUPPLY, name, "online")) == "1":
+                on_battery = False
+                break
+    except OSError:
+        pass
+
+    return {
+        "node": os.path.basename(node),
+        "level": int(round(level)) if level is not None else None,
+        "status": status,
+        "energy_wh": energy,
+        "full_wh": full,
+        "design_wh": design,
+        "unit": unit,
+        "on_battery": on_battery,
+        "charging": status in ("Charging", "Full") or not on_battery,
+    }
+
+
+def _run_json(command):
+    try:
+        out = subprocess.run(
+            command, capture_output=True, text=True, timeout=3, stdin=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def screen_on():
+    """True while any monitor is powered. None when Hyprland cannot be asked."""
+    monitors = _run_json(["hyprctl", "monitors", "-j"])
+    if not isinstance(monitors, list) or not monitors:
+        return None
+    return any(bool(monitor.get("dpmsStatus")) for monitor in monitors if isinstance(monitor, dict))
+
+
+def _proc_table():
+    """pid -> (ppid, cpu ticks). Kernel threads have no cmdline but do have stats."""
+    table = {}
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return table
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(os.path.join(entry.path, "stat"), "r", encoding="utf-8", errors="replace") as handle:
+                    stat = handle.read()
+            except OSError:
+                continue
+            close = stat.rfind(")")
+            if close < 0:
+                continue
+            fields = stat[close + 2:].split()
+            if len(fields) < 13:
+                continue
+            try:
+                table[int(entry.name)] = (int(fields[1]), int(fields[11]) + int(fields[12]))
+            except ValueError:
+                continue
+    return table
+
+
+def app_usage():
+    """(ticks per app class, focused class). Empty when no compositor is present."""
+    clients = _run_json(["hyprctl", "clients", "-j"])
+    if not isinstance(clients, list):
+        return {}, None
+
+    owners = {}
+    focused = None
+    for client in clients:
+        if not isinstance(client, dict):
+            continue
+        name = client.get("class") or client.get("initialClass") or ""
+        pid = client.get("pid")
+        if not isinstance(pid, int) or not name:
+            continue
+        owners.setdefault(pid, name)
+        if client.get("focused"):
+            focused = name
+
+    # Some Hyprland builds report no focused flag on any client even while a
+    # window is active; activewindow is the same compositor's authoritative
+    # answer, so prefer it over losing focus time entirely.
+    if focused is None:
+        active = _run_json(["hyprctl", "activewindow", "-j"])
+        if isinstance(active, dict):
+            focused = active.get("class") or active.get("initialClass") or None
+
+    table = _proc_table()
+    ticks = {}
+    for pid, (_ppid, cpu) in table.items():
+        cursor = pid
+        for _ in range(24):
+            if cursor in owners:
+                name = owners[cursor]
+                ticks[name] = ticks.get(name, 0) + cpu
+                break
+            parent = table.get(cursor, (0, 0))[0]
+            if parent <= 1 or parent == cursor:
+                break
+            cursor = parent
+    return ticks, focused
+
+
+# ------------------------------------------------------------------- state ---
+
+
+def empty_day(date_key, capacity_wh):
+    return {
+        "date": date_key,
+        "energy_wh": 0.0,
+        "capacity_wh": capacity_wh or 0.0,
+        "apps": {},
+        "activity": {"apps": {}},
+        "hours": [{"h": hour, "wh": 0.0, "level": None, "charging": False,
+                   "screen_on": 0.0, "screen_off": 0.0} for hour in range(24)],
+        "screen_on": 0.0,
+        "screen_off": 0.0,
+        "seeded": False,
+    }
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        state = None
+    if not isinstance(state, dict):
+        state = {}
+    state.setdefault("version", 1)
+    state.setdefault("days", {})
+    state.setdefault("last", None)
+    state.setdefault("since", None)
+    return state
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    temp = STATE_FILE + ".tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, separators=(",", ":"), sort_keys=True)
+    os.replace(temp, STATE_FILE)
+
+
+def locked(exclusive=True):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    handle = open(LOCK_FILE, "a+")
+    fcntl.flock(handle, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    return handle
+
+
+def prune(state, today):
+    keep = {(today - timedelta(days=offset)).isoformat() for offset in range(RETENTION_DAYS)}
+    for key in list(state["days"]):
+        if key not in keep:
+            del state["days"][key]
+
+
+# ------------------------------------------------------------ UPower backfill ---
+
+
+def _upower_battery_object():
+    executable = shutil.which("upower")
+    if not executable:
+        return None
+    try:
+        out = subprocess.run([executable, "-e"], capture_output=True, text=True, timeout=4,
+                             stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        if "/battery_" in line:
+            return line.strip()
+    return None
+
+
+def _upower_history():
+    """UPower's own (timestamp, level %, state) points — real recorded history.
+
+    Seven days at ten-minute resolution: enough to fill the chart's week with
+    recorded data instead of waiting a week before the first bar appears.
+    """
+    busctl = shutil.which("busctl")
+    path = _upower_battery_object()
+    if not busctl or not path:
+        return []
+    try:
+        out = subprocess.run(
+            [busctl, "--system", "call", "org.freedesktop.UPower", path,
+             "org.freedesktop.UPower.Device", "GetHistory", "suu", "charge", "604800", "600"],
+            capture_output=True, text=True, timeout=6, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    tokens = out.stdout.split()
+    if len(tokens) < 2 or not tokens[0].startswith("a("):
+        return []
+    try:
+        count = int(tokens[1])
+    except ValueError:
+        return []
+    values = tokens[2:]
+    points = []
+    for index in range(min(count, len(values) // 3)):
+        try:
+            points.append((
+                int(values[index * 3]),
+                float(values[index * 3 + 1]),
+                int(values[index * 3 + 2]),
+            ))
+        except ValueError:
+            continue
+    points.sort()
+    return points
+
+
+def _empty_day(day):
+    return day["energy_wh"] <= 0 and not any(bucket["wh"] > 0 for bucket in day["hours"])
+
+
+def seed_days(state, capacity_wh):
+    """Backfill days from UPower history: energy drawn per hour and level values.
+
+    Only days with no metered energy are filled, so a day the sampler already
+    watched is never double-counted by the backfill.
+    """
+    if not capacity_wh:
+        return False
+    points = _upower_history()
+    if len(points) < 2:
+        return False
+
+    grouped = {}
+    for point in points:
+        grouped.setdefault(datetime.fromtimestamp(point[0]).date().isoformat(), []).append(point)
+
+    # A discharge that crosses midnight starts in the previous day's last point;
+    # carrying that point in as context keeps the midnight hour from reading 0%.
+    ordered = sorted(points)
+
+    changed = False
+    for key, day_points in grouped.items():
+        midnight = datetime.combine(datetime.fromisoformat(key), datetime.min.time()).timestamp()
+        earlier = [point for point in ordered if point[0] < midnight]
+        if earlier:
+            day_points = [earlier[-1]] + day_points
+        day = state["days"].get(key)
+        if day is None:
+            day = empty_day(key, capacity_wh)
+            day["capacity_wh"] = capacity_wh
+            state["days"][key] = day
+        if day["seeded"]:
+            continue
+        if not _empty_day(day):
+            day["seeded"] = True
+            continue
+        for previous, current in zip(day_points, day_points[1:]):
+            timestamp, level, state_now = current
+            _prev_ts, prev_level, prev_state = previous
+            hour = int(datetime.fromtimestamp(timestamp).strftime("%H"))
+            bucket = day["hours"][hour]
+            bucket["level"] = level
+            if prev_state == 2 and state_now in (2, 4) and level < prev_level:
+                wh = (prev_level - level) / 100.0 * capacity_wh
+                bucket["wh"] += wh
+                day["energy_wh"] += wh
+                changed = True
+            if state_now == 1 or prev_state == 1:
+                bucket["charging"] = True
+        day["seeded"] = True
+    return changed
+
+
+# ------------------------------------------------------------------ sampling ---
+
+
+def sample(state):
+    battery = read_battery()
+    now = time.time()
+    today = datetime.fromtimestamp(now).date()
+    key = today.isoformat()
+
+    if state.get("since") is None:
+        state["since"] = key
+
+    capacity = (battery or {}).get("full_wh") or (battery or {}).get("design_wh") or 0.0
+    day = state["days"].get(key)
+    if day is None:
+        day = empty_day(key, capacity)
+        state["days"][key] = day
+    if not day["seeded"]:
+        seed_days(state, capacity)
+
+    if not battery:
+        state["last"] = None
+        return state
+
+    if capacity and day["capacity_wh"] != capacity:
+        day["capacity_wh"] = capacity
+
+    ticks, focused = app_usage()
+    is_on = screen_on()
+    level = battery["level"]
+    hour = int(datetime.fromtimestamp(now).strftime("%H"))
+    bucket = day["hours"][hour]
+    if level is not None:
+        bucket["level"] = level
+    if battery["status"] == "Charging":
+        bucket["charging"] = True
+    day["capacity_wh"] = day["capacity_wh"] or capacity
+
+    previous = state.get("last")
+    attributed = 0.0
+    if isinstance(previous, dict):
+        elapsed = now - float(previous.get("ts") or 0)
+        if 0 < elapsed <= MAX_GAP:
+            prev_ticks = previous.get("apps") or {}
+            tick_deltas = {}
+            for name, cpu in (ticks or {}).items():
+                delta = max(0.0, float(cpu) - float(prev_ticks.get(name) or 0))
+                if delta > 0:
+                    tick_deltas[name] = delta
+
+            # CPU deltas are measured work whether or not the pack is draining,
+            # so the app share keeps filling while the machine sits on AC. It is
+            # reported as activity share, never disguised as battery drain.
+            if tick_deltas:
+                activity = day.setdefault("activity", {"apps": {}})
+                for name, delta in tick_deltas.items():
+                    activity["apps"][name] = float(activity["apps"].get(name) or 0.0) + delta
+
+            prev_energy = previous.get("energy_wh")
+            energy = battery["energy_wh"]
+            if (previous.get("on_battery") and battery["on_battery"]
+                    and isinstance(prev_energy, (int, float)) and energy is not None):
+                drawn = max(0.0, float(prev_energy) - float(energy))
+                if drawn > 0:
+                    attributed = drawn
+                    day["energy_wh"] += drawn
+                    bucket["wh"] += drawn
+                    share_total = sum(tick_deltas.values())
+                    for name, delta in tick_deltas.items():
+                        wh = drawn * delta / share_total if share_total > 0 else 0.0
+                        entry = day["apps"].setdefault(name, {"wh": 0.0, "seconds": 0.0})
+                        entry["wh"] += wh
+
+            if previous.get("screen_on") is not None:
+                if previous["screen_on"]:
+                    day["screen_on"] += elapsed
+                    bucket["screen_on"] += elapsed
+                else:
+                    day["screen_off"] += elapsed
+                    bucket["screen_off"] += elapsed
+
+            if focused and is_on and elapsed <= SAMPLE_INTERVAL * 2:
+                entry = day["apps"].setdefault(focused, {"wh": 0.0, "seconds": 0.0})
+                entry["seconds"] += elapsed
+
+    state["last"] = {
+        "ts": now,
+        "energy_wh": battery["energy_wh"],
+        "on_battery": battery["on_battery"],
+        "level": level,
+        "screen_on": is_on,
+        "apps": ticks,
+        "total_ticks": sum(ticks.values()) if ticks else 0,
+        "attributed_wh": attributed,
+    }
+    return state
+
+
+# -------------------------------------------------------------------- report ---
+
+
+def _pct(value, capacity):
+    if not capacity or value is None:
+        return None
+    return max(0.0, min(400.0, value / capacity * 100.0))
+
+
+def _empty_hours():
+    """Twenty-four unmeasured buckets, so a day with no record still draws its grid."""
+    return [{"h": hour, "level": None, "charging": False} for hour in range(24)]
+
+
+def _day_hours(record):
+    """The day's own level buckets, exactly as the sampler wrote them."""
+    hours = []
+    for bucket in record.get("hours") or []:
+        hours.append({
+            "h": bucket.get("h"),
+            "level": bucket.get("level"),
+            "charging": bool(bucket.get("charging")),
+        })
+    return hours or _empty_hours()
+
+
+def _battery_app_rows(record, label):
+    """Apps whose measured discharge in this day can be priced in pack percent."""
+    capacity = float(record.get("capacity_wh") or 0.0)
+    rows = []
+    for name, entry in (record.get("apps") or {}).items():
+        wh = float(entry.get("wh") or 0.0)
+        pct = _pct(wh, capacity)
+        if pct is None or pct <= 0:
+            continue
+        rows.append({
+            "name": name,
+            "pct": pct,
+            "seconds": float(entry.get("seconds") or 0.0),
+            "basis": label,
+        })
+    rows.sort(key=lambda item: item["pct"], reverse=True)
+    return rows
+
+
+def _activity_app_rows(record, label):
+    """Apps' share of the CPU work measured today — activity, not pack drain."""
+    ticks = (record.get("activity") or {}).get("apps") or {}
+    total = sum(max(0.0, float(value or 0.0)) for value in ticks.values())
+    if total <= 0:
+        return []
+    rows = []
+    for name, value in ticks.items():
+        value = max(0.0, float(value or 0.0))
+        if value <= 0:
+            continue
+        entry = (record.get("apps") or {}).get(name) or {}
+        rows.append({
+            "name": name,
+            "pct": value / total * 100.0,
+            "seconds": float(entry.get("seconds") or 0.0),
+            "basis": label,
+        })
+    rows.sort(key=lambda item: item["pct"], reverse=True)
+    return rows
+
+
+def build_report(state):
+    now = datetime.now()
+    today_key = now.date().isoformat()
+    days = state["days"]
+    day = days.get(today_key)
+
+    report_days = []
+    previous_by_now = []
+    for offset in range(6, -1, -1):
+        date = now.date() - timedelta(days=offset)
+        key = date.isoformat()
+        record = days.get(key)
+        if not record:
+            # A day the meter never saw still gets its grid and its date, with
+            # `measured: false` telling the UI to say so instead of drawing 0%.
+            report_days.append({
+                "date": key,
+                "label": date.strftime("%a")[0],
+                "day": date.day,
+                "month": date.month,
+                "used": None,
+                "byNow": None,
+                "today": key == today_key,
+                "energyWh": None,
+                "capacityWh": None,
+                "screenOn": None,
+                "screenOff": None,
+                "measured": False,
+                "hours": _empty_hours(),
+                "apps": [],
+            })
+            continue
+        capacity = record.get("capacity_wh") or 0.0
+        used = 0.0
+        by_now = 0.0
+        for hour in record.get("hours", []):
+            wh = float(hour.get("wh") or 0.0)
+            used += wh
+            if key != today_key or int(hour.get("h", 0)) <= now.hour:
+                by_now += wh
+        # Everything below is per-day so tapping a bar can open that day's own
+        # curve and totals. The app rows are that day's measured discharge only:
+        # a day backfilled from UPower's history has no attribution to show, and
+        # the report says so with an empty list rather than borrowing today's.
+        hours = _day_hours(record)
+        measured = (float(record.get("energy_wh") or 0.0) > 0.0
+                    or any(hour.get("level") is not None for hour in hours))
+        day_apps = _battery_app_rows(
+            record, "of battery used " + str(date.day) + " " + date.strftime("%b"))[:MAX_APPS]
+        report_days.append({
+            "date": key,
+            "label": date.strftime("%a")[0],
+            "day": date.day,
+            "month": date.month,
+            "used": _pct(used, capacity),
+            "byNow": _pct(by_now, capacity),
+            "today": key == today_key,
+            "energyWh": float(record.get("energy_wh") or 0.0),
+            "capacityWh": capacity,
+            "screenOn": float(record.get("screen_on") or 0.0),
+            "screenOff": float(record.get("screen_off") or 0.0),
+            "measured": measured,
+            "hours": hours,
+            "apps": day_apps,
+        })
+        if key != today_key and by_now > 0:
+            previous_by_now.append(_pct(by_now, capacity))
+
+    # Every row is measured, and every row says what its percentage is a share
+    # of. A brief discharge must not hide the work happening while charging, so
+    # today's battery rows and today's activity rows are listed together —
+    # current-session activity first on AC. Only when neither exists today does
+    # the list fall back to the last day that actually discharged; with no
+    # measurement at all it says so instead of showing zeroes.
+    apps = []
+    apps_note = "No app activity measured yet"
+    capacity = (day or {}).get("capacity_wh") or 0.0
+    battery_today = _battery_app_rows(day, "of battery used today") if day else []
+    activity_today = _activity_app_rows(day, "of CPU activity today") if day else []
+    if battery_today or activity_today:
+        on_battery = bool((state.get("last") or {}).get("on_battery"))
+        ordered = (battery_today + activity_today) if on_battery else (activity_today + battery_today)
+        apps = ordered[:MAX_APPS]
+        apps_note = ""
+    else:
+        for offset in range(1, RETENTION_DAYS):
+            key = (now.date() - timedelta(days=offset)).isoformat()
+            record = days.get(key)
+            if not record:
+                continue
+            date = datetime.fromisoformat(key)
+            rows = _battery_app_rows(record, f"of battery used {date.day} {date.strftime('%b')}")
+            if rows:
+                apps = rows
+                apps_note = ""
+                break
+
+    hours = []
+    if day:
+        for bucket in day.get("hours", []):
+            hours.append({
+                "h": bucket.get("h"),
+                "level": bucket.get("level"),
+                "charging": bool(bucket.get("charging")),
+            })
+
+    average = None
+    if previous_by_now:
+        average = sum(previous_by_now) / len(previous_by_now)
+
+    used_today = _pct((day or {}).get("energy_wh"), capacity)
+    return {
+        "tracking": {
+            "since": state.get("since"),
+            "days": len(days),
+            "samples": 1 if state.get("last") else 0,
+        },
+        "now": {
+            "minutes": now.hour * 60 + now.minute,
+            "clock": now.strftime("%H:%M"),
+            "date": now.date().isoformat(),
+        },
+        "today": {
+            "date": today_key,
+            "usedPct": used_today,
+            "energyWh": float((day or {}).get("energy_wh") or 0.0),
+            "capacityWh": capacity,
+            "level": (state.get("last") or {}).get("level"),
+            "screenOn": float((day or {}).get("screen_on") or 0.0),
+            "screenOff": float((day or {}).get("screen_off") or 0.0),
+            "metered": bool(state.get("last")),
+        },
+        "daily": report_days,
+        "hours": hours,
+        "apps": apps,
+        "appsNote": apps_note,
+        "comparison": {
+            "averageByNow": average,
+            "days": len(previous_by_now),
+        },
+    }
+
+
+# ---------------------------------------------------------------------- main ---
+
+
+def daemon():
+    stop = {"flag": False}
+
+    def _stop(_signum, _frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    while not stop["flag"]:
+        try:
+            with locked():
+                state = load_state()
+                sample(state)
+                prune(state, datetime.now().date())
+                save_state(state)
+        except OSError:
+            pass
+        deadline = time.time() + SAMPLE_INTERVAL
+        while not stop["flag"] and time.time() < deadline:
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
+
+
+def main(argv):
+    mode = "--sample"
+    for arg in argv[1:]:
+        if arg in ("--sample", "--daemon", "--report"):
+            mode = arg
+
+    if mode == "--daemon":
+        daemon()
+        return 0
+
+    if mode == "--report":
+        with locked(exclusive=False):
+            state = load_state()
+            # A panel opened before the first sample still gets the day backfilled
+            # from UPower, so the charts are never blank on a fresh install.
+            today_key = datetime.now().date().isoformat()
+            day = state["days"].get(today_key)
+            battery = read_battery()
+            capacity = (battery or {}).get("full_wh") or (battery or {}).get("design_wh") or 0.0
+            if day is None:
+                day = empty_day(today_key, capacity)
+                state["days"][today_key] = day
+            if not day["seeded"]:
+                seed_days(state, capacity or day.get("capacity_wh"))
+            if state.get("since") is None:
+                state["since"] = today_key
+        print(json.dumps(build_report(state), separators=(",", ":")))
+        return 0
+
+    with locked():
+        state = load_state()
+        sample(state)
+        prune(state, datetime.now().date())
+        save_state(state)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

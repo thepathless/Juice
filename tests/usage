@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# Pins the usage report's arithmetic: a day's percentage comes from its hourly
+# energy, the by-now split stops at the current hour, the comparison only counts
+# days that actually saw a discharge, and apps are ordered by their share.
+
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+command -v python3 >/dev/null || { printf 'skip: python3 not found\n' >&2; exit 77; }
+command -v jq >/dev/null || { printf 'skip: jq not found\n' >&2; exit 77; }
+
+script="$root/scripts/juice-usage"
+# Compile in memory: py_compile would leave __pycache__ inside the plugin tree.
+python3 - "$script" <<'PY'
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    compile(handle.read(), path, "exec")
+PY
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/state"
+
+today=$(date +%F)
+yesterday=$(date -d yesterday +%F)
+
+# Two metered days: yesterday burned 3.0 Wh, today 0.75 Wh so far. Hours are
+# written as the sampler writes them so the report reads them unchanged.
+python3 - "$work/state/usage.json" "$today" "$yesterday" <<'PY'
+import json
+import sys
+
+path, today, yesterday = sys.argv[1:4]
+hours_today = [
+    {"h": hour, "wh": 0.25 if hour <= 2 else 0.0, "level": 80,
+     "charging": False, "screen_on": 0.0, "screen_off": 0.0}
+    for hour in range(24)
+]
+hours_yesterday = [
+    {"h": hour, "wh": 0.5 if hour <= 5 else 0.0, "level": 64,
+     "charging": False, "screen_on": 0.0, "screen_off": 0.0}
+    for hour in range(24)
+]
+state = {
+    "version": 1,
+    "since": yesterday,
+    "last": None,
+    "days": {
+        yesterday: {
+            "date": yesterday, "energy_wh": 3.0, "capacity_wh": 40.0,
+            "apps": {}, "hours": hours_yesterday, "screen_on": 0.0,
+            "screen_off": 0.0, "seeded": True,
+        },
+        today: {
+            "date": today, "energy_wh": 0.75, "capacity_wh": 40.0,
+            "apps": {
+                "foot": {"wh": 0.2, "seconds": 120.0},
+                "chrome": {"wh": 1.0, "seconds": 600.0},
+            },
+            "hours": hours_today, "screen_on": 3600.0, "screen_off": 600.0,
+            "seeded": True,
+        },
+    },
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(state, handle)
+PY
+
+JUICE_STATE_DIR="$work/state" "$script" --report >"$work/report.json"
+
+jq -e '(.today.usedPct - 1.875) | fabs < 0.0001' "$work/report.json" >/dev/null
+jq -e '.today.screenOn == 3600 and .today.screenOff == 600' "$work/report.json" >/dev/null
+jq -e '.apps[0].name == "chrome" and (.apps[0].pct - 2.5 | fabs < 0.0001)' "$work/report.json" >/dev/null
+jq -e '.apps[1].name == "foot"' "$work/report.json" >/dev/null
+jq -e '.appsNote == "" and .apps[0].basis == "of battery used today"' "$work/report.json" >/dev/null
+jq -e '.comparison.averageByNow == 7.5 and .comparison.days == 1' "$work/report.json" >/dev/null
+jq -e '.daily[-1].today == true and .daily[-2].used == 7.5' "$work/report.json" >/dev/null
+jq -e '.daily[0].used == null' "$work/report.json" >/dev/null
+jq -e '.hours | length == 24' "$work/report.json" >/dev/null
+
+# Every day carries its own detail, because tapping a bar must show that day's
+# curve and totals: 24 level buckets, its energy, and whether it was metered.
+jq -e 'all(.daily[]; (.hours | length) == 24)' "$work/report.json" >/dev/null
+jq -e '.daily[-1].measured == true and .daily[-1].hours[2].level == 80' "$work/report.json" >/dev/null
+jq -e '.daily[-2].measured == true and (.daily[-2].hours[0].level == 64)' "$work/report.json" >/dev/null
+jq -e '.daily[-2].energyWh == 3.0 and .daily[-2].capacityWh == 40.0' "$work/report.json" >/dev/null
+jq -e '.daily[-2].screenOn == 0 and .daily[-2].screenOff == 0' "$work/report.json" >/dev/null
+# An unmetered day is empty, not zero: no bars, no energy, no app rows.
+jq -e '.daily[0].measured == false and .daily[0].energyWh == null' "$work/report.json" >/dev/null
+jq -e '([.daily[0].hours[].level] | unique) == [null] and .daily[0].apps == []' "$work/report.json" >/dev/null
+# App attribution is per-day: today's rows exist, yesterday's do not.
+jq -e '(.daily[-1].apps | length) == 2 and .daily[-2].apps == []' "$work/report.json" >/dev/null
+jq -e '.daily[-1].apps[0].basis | test("^of battery used [0-9]+ [A-Z][a-z]{2}$")' "$work/report.json" >/dev/null
+
+# The by-now split stops at the current hour: today's byNow may never exceed
+# today's measured total, and a future hour contributes nothing.
+if [[ $(date +%-H) -lt 2 ]]; then
+  jq -e '.daily[-1].byNow < .daily[-1].used' "$work/report.json" >/dev/null
+fi
+
+# The fallbacks that keep the list populated on a machine that lives on AC.
+# Derived from the same fixture so the reported percentages are checkable.
+for variant in past activity none mixed mixedbatt; do mkdir -p "$work/$variant"; done
+python3 - "$work/state/usage.json" "$work" <<'PY'
+import json
+import sys
+
+source, root = sys.argv[1:3]
+with open(source, encoding="utf-8") as handle:
+    base = json.load(handle)
+today, yesterday = sorted(base["days"])[-1], sorted(base["days"])[-2]
+
+past = json.loads(json.dumps(base))
+past["days"][today]["apps"] = {}
+past["days"][yesterday]["apps"] = {
+    "chrome": {"wh": 2.0, "seconds": 900.0},
+    "foot": {"wh": 1.0, "seconds": 300.0},
+}
+with open(root + "/past/usage.json", "w", encoding="utf-8") as handle:
+    json.dump(past, handle)
+
+# A brief discharge plus the charging session in front of the user: both
+# measurements must survive, with the current activity leading on AC.
+mixed = json.loads(json.dumps(base))
+mixed["days"][today]["apps"] = {
+    "chrome": {"wh": 1.0, "seconds": 600.0},
+    "foot": {"wh": 0.2, "seconds": 120.0},
+}
+mixed["days"][today]["activity"] = {
+    "apps": {"chrome": 750.0, "foot": 250.0},
+}
+mixed["last"] = {"on_battery": False}
+with open(root + "/mixed/usage.json", "w", encoding="utf-8") as handle:
+    json.dump(mixed, handle)
+
+# The same measurements on battery: the stronger battery share must lead.
+with open(root + "/mixedbatt/usage.json", "w", encoding="utf-8") as handle:
+    mixed["last"] = {"on_battery": True}
+    json.dump(mixed, handle)
+
+activity = json.loads(json.dumps(base))
+activity["days"][today]["apps"] = {
+    "chrome": {"wh": 0.0, "seconds": 1200.0},
+    "foot": {"wh": 0.0, "seconds": 300.0},
+}
+activity["days"][today]["activity"] = {
+    "apps": {"chrome": 750.0, "foot": 250.0},
+}
+with open(root + "/activity/usage.json", "w", encoding="utf-8") as handle:
+    json.dump(activity, handle)
+
+none = json.loads(json.dumps(base))
+none["days"][today]["apps"] = {}
+with open(root + "/none/usage.json", "w", encoding="utf-8") as handle:
+    json.dump(none, handle)
+PY
+
+JUICE_STATE_DIR="$work/past" "$script" --report >"$work/past.json"
+jq -e '.appsNote == ""' "$work/past.json" >/dev/null
+jq -e '.apps[0].name == "chrome" and .apps[0].pct == 5 and .apps[0].seconds == 900' "$work/past.json" >/dev/null
+jq -e '.apps[0].basis | test("of battery used")' "$work/past.json" >/dev/null
+# The earlier day's recorded app rows travel with that day, sorted the same way.
+jq -e '(.daily[-2].apps | length) == 2 and .daily[-2].apps[0].name == "chrome"' "$work/past.json" >/dev/null
+jq -e '(.daily[-2].apps[0].pct - 5 | fabs < 0.0001) and (.daily[-2].apps[0].seconds == 900)' "$work/past.json" >/dev/null
+
+JUICE_STATE_DIR="$work/activity" "$script" --report >"$work/activity.json"
+jq -e '.appsNote == ""' "$work/activity.json" >/dev/null
+jq -e '.apps[0].name == "chrome" and .apps[0].pct == 75' "$work/activity.json" >/dev/null
+jq -e '.apps[0].basis == "of CPU activity today"' "$work/activity.json" >/dev/null
+jq -e '.apps[1].name == "foot" and .apps[1].pct == 25 and .apps[1].seconds == 300' "$work/activity.json" >/dev/null
+
+JUICE_STATE_DIR="$work/mixed" "$script" --report >"$work/mixed.json"
+jq -e '.appsNote == "" and .apps[0].basis == "of CPU activity today"' "$work/mixed.json" >/dev/null
+jq -e '[.apps[].basis] | unique | length == 2' "$work/mixed.json" >/dev/null
+jq -e '[.apps[] | select(.name == "chrome" and (.basis | startswith("of battery")))][0].pct == 2.5' "$work/mixed.json" >/dev/null
+
+JUICE_STATE_DIR="$work/mixedbatt" "$script" --report >"$work/mixedbatt.json"
+jq -e '.apps[0].basis == "of battery used today"' "$work/mixedbatt.json" >/dev/null
+jq -e '[.apps[] | select(.basis == "of CPU activity today")] | length == 2' "$work/mixedbatt.json" >/dev/null
+
+JUICE_STATE_DIR="$work/none" "$script" --report >"$work/none.json"
+jq -e '(.appsNote | length) > 0 and (.apps | length) == 0' "$work/none.json" >/dev/null
+
+# The sampler itself: CPU deltas must accrue on AC without inventing pack
+# energy, so the activity fallback has something real to report.
+JUICE_USAGE_SCRIPT="$script" python3 - <<'PY'
+import importlib.util
+import os
+import sys
+from importlib.machinery import SourceFileLoader
+
+sys.dont_write_bytecode = True
+path = os.environ["JUICE_USAGE_SCRIPT"]
+loader = SourceFileLoader("juice_usage", path)
+module = importlib.util.module_from_spec(importlib.util.spec_from_loader("juice_usage", loader))
+loader.exec_module(module)
+module.seed_days = lambda *args: False
+module.screen_on = lambda: True
+module.read_battery = lambda: {
+    "node": "BAT0", "level": 80, "status": "Charging", "energy_wh": 30.0,
+    "full_wh": 40.0, "design_wh": 45.0, "unit": "Wh", "on_battery": False,
+    "charging": True,
+}
+state = {"version": 1, "days": {}, "last": None, "since": None}
+real_app_usage = module.app_usage
+module.app_usage = lambda: ({"chrome": 100, "foot": 50}, "chrome")
+module.sample(state)
+module.app_usage = lambda: ({"chrome": 300, "foot": 60}, "foot")
+state["last"]["ts"] -= 60
+module.sample(state)
+day = next(iter(state["days"].values()))
+activity = day["activity"]["apps"]
+assert activity == {"chrome": 200.0, "foot": 10.0}, activity
+assert all(entry["wh"] == 0 for entry in day["apps"].values()), day["apps"]
+
+# Hyprland builds that never set a client's focused flag must still yield a
+# focused class through activewindow, otherwise focus time stays permanently 0.
+module._run_json = lambda command: (
+    [{"class": "kitty", "pid": 42}] if "clients" in command else {"class": "kitty"}
+)
+module._proc_table = lambda: {42: (1, 100)}
+ticks, focused = real_app_usage()
+assert focused == "kitty", focused
+assert ticks == {"kitty": 100}, ticks
+PY
+
+if compgen -G "/sys/class/power_supply/BAT*" >/dev/null; then
+  mkdir -p "$work/live"
+  JUICE_STATE_DIR="$work/live" "$script" --sample
+  JUICE_STATE_DIR="$work/live" "$script" --report >"$work/live.json"
+  jq -e '.today.capacityWh > 0 and (.hours | length == 24)' "$work/live.json" >/dev/null
+  jq -e '.tracking.samples == 1' "$work/live.json" >/dev/null
+else
+  printf 'skip: no battery present, live sample not exercised\n' >&2
+fi
+
+printf 'battery usage OK\n'
