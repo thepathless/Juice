@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OmaBattery — read-only battery probe.
+# Juice — read-only battery probe.
 #
 # Prints tab-separated key/value pairs consumed by Panel.qml through the same
 # parseKeyValue() helper the stock omarchy.power panel uses. Every value is read
@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-POWER_SUPPLY="${OMABATTERY_POWER_SUPPLY_PATH:-/sys/class/power_supply}"
+POWER_SUPPLY="${JUICE_POWER_SUPPLY_PATH:-/sys/class/power_supply}"
 
 # Read a sysfs number with all whitespace stripped.
 num() {

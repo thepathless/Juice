@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OmaBattery installer.
+# Juice installer.
 #
 # Idempotent: safe to run repeatedly. Does three things:
 #   1. validates the manifest and links/copies the plugin into the Omarchy
@@ -18,10 +18,10 @@ set -euo pipefail
 PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PLUGINS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-UNIT_NAME="omabattery-charge-target.service"
-UDEV_SRC="$PLUGIN_DIR/udev/99-omabattery-charge-thresholds.rules"
-UDEV_DST="/etc/udev/rules.d/99-omabattery-charge-thresholds.rules"
-POWER_SUPPLY="${OMABATTERY_POWER_SUPPLY_PATH:-/sys/class/power_supply}"
+UNIT_NAME="juice-charge-target.service"
+UDEV_SRC="$PLUGIN_DIR/udev/99-juice-charge-thresholds.rules"
+UDEV_DST="/etc/udev/rules.d/99-juice-charge-thresholds.rules"
+POWER_SUPPLY="${JUICE_POWER_SUPPLY_PATH:-/sys/class/power_supply}"
 
 ENABLE=1
 for arg in "$@"; do
@@ -46,7 +46,7 @@ command -v jq >/dev/null 2>&1 || {
 PLUGIN_ID="$(jq -r '.id' "$PLUGIN_DIR/manifest.json")"
 TARGET="$PLUGINS_DIR/$PLUGIN_ID"
 
-printf '\nOmaBattery installer\n'
+printf '\nJuice installer\n'
 printf '  plugin: %s\n' "$PLUGIN_ID"
 
 # --- 1. validate + place the plugin ------------------------------------------
@@ -58,7 +58,7 @@ else
   printf '  manifest: omarchy-plugin-validate not found, skipped\n'
 fi
 
-chmod +x "$PLUGIN_DIR"/scripts/omabattery-*
+chmod +x "$PLUGIN_DIR"/scripts/juice-*
 
 mkdir -p "$PLUGINS_DIR"
 if [[ "$TARGET" == "$PLUGIN_DIR" ]]; then
@@ -129,5 +129,5 @@ fi
 # --- 5. report the live hardware state ---------------------------------------
 
 printf '\nCurrent hardware state:\n'
-bash "$PLUGIN_DIR/scripts/omabattery-stats" | sed 's/^/  /'
+bash "$PLUGIN_DIR/scripts/juice-stats" | sed 's/^/  /'
 printf '\nDone. Open the bar widget and use "Charge to 80%%" / "Charge to 100%%".\n'

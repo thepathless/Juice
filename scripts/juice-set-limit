@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# OmaBattery — apply a hardware charge target.
+# Juice — apply a hardware charge target.
 #
-#   omabattery-set-limit <1-100>   set the target and remember it
-#   omabattery-set-limit --restore re-apply the remembered target (boot unit)
+#   juice-set-limit <1-100>   set the target and remember it
+#   juice-set-limit --restore re-apply the remembered target (boot unit)
 #
 # Writes the kernel charge threshold attributes directly. Privilege comes from a
 # udev rule installed by install.sh that makes these two attributes writable by
@@ -11,8 +11,8 @@
 #
 #   1. The embedded controller stores the thresholds in NVRAM on ThinkPads, so
 #      they survive a reboot on their own.
-#   2. The chosen target is saved to ~/.local/state/omabattery/charge-target and
-#      re-applied by the omabattery-charge-target user unit at login, which
+#   2. The chosen target is saved to ~/.local/state/juice/charge-target and
+#      re-applied by the juice-charge-target user unit at login, which
 #      covers hardware whose EC forgets.
 #
 # Output is tab-separated key/value pairs, matching the panel's parser:
@@ -21,9 +21,9 @@
 
 set -euo pipefail
 
-POWER_SUPPLY="${OMABATTERY_POWER_SUPPLY_PATH:-/sys/class/power_supply}"
+POWER_SUPPLY="${JUICE_POWER_SUPPLY_PATH:-/sys/class/power_supply}"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-STATE_DIR="$STATE_HOME/omabattery"
+STATE_DIR="$STATE_HOME/juice"
 STATE_FILE="$STATE_DIR/charge-target"
 
 fail() {

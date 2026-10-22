@@ -1,7 +1,7 @@
-# OmaBattery — make the battery charge thresholds writable by the desktop user.
+# Juice — make the battery charge thresholds writable by the desktop user.
 #
 # The kernel exposes charge_control_start_threshold / charge_control_end_threshold
-# as root-only attributes. This rule is the single privilege mechanism OmaBattery
+# as root-only attributes. This rule is the single privilege mechanism Juice
 # uses: it chmods those attributes (and the older charge_start/stop_threshold
 # naming) when the battery appears, so the panel and the login restore unit can
 # write them directly. No sudo, pkexec or polkit helper is involved at runtime.

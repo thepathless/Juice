@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Renders BatteryIcon.qml off a live shell and pins its geometry at the three
+# sizes the manifest exposes at the ends of the range: the glyph must keep its
+# measured size, stay non-blank, and keep the terminal nub on the right edge.
+#
+# Needs a Wayland session (Quickshell cannot open an offscreen surface),
+# `qs`, ImageMagick and coreutils. Set OMARCHY_SHELL_DIR when the shell is not
+# installed at /usr/share/omarchy/shell. Exit 77 when the shell module is not
+# installed, so a plain checkout can skip instead of failing.
+
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+shell_dir=${OMARCHY_SHELL_DIR:-/usr/share/omarchy/shell}
+
+if [[ ! -r $shell_dir/Commons/qmldir ]]; then
+  printf 'skip: %s/Commons/qmldir not found (set OMARCHY_SHELL_DIR)\n' "$shell_dir" >&2
+  exit 77
+fi
+command -v qs >/dev/null || { printf 'skip: qs not found\n' >&2; exit 77; }
+command -v magick >/dev/null || { printf 'skip: magick not found\n' >&2; exit 77; }
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# Quickshell resolves `qs.Commons` from an import root that holds a `qs` entry.
+mkdir -p "$work/import"
+ln -s "$shell_dir" "$work/import/qs"
+cp "$root/BatteryIcon.qml" "$work/BatteryIcon.qml"
+
+# 11 / 13 / 18 px are the manifest's range ends plus the default. Level 81
+# exercises both the filled body and the empty track in one glyph.
+cat > "$work/shell.qml" <<QML
+import QtQuick
+import Quickshell
+import qs.Commons
+
+ShellRoot {
+  PanelWindow {
+    id: panel
+    implicitWidth: 140
+    implicitHeight: 60
+    color: "#000000"
+
+    Row {
+      x: 8
+      y: 8
+      spacing: 10
+
+      Repeater {
+        id: rep
+        model: [11, 13, 18]
+        BatteryIcon {
+          iconSize: modelData
+          level: 81
+          color: "#ffffff"
+          contentColor: "#ffffff"
+        }
+      }
+    }
+
+    property int grabbed: 0
+    onGrabbedChanged: if (grabbed === rep.count) Qt.quit()
+
+    Timer {
+      interval: 400
+      running: true
+      onTriggered: {
+        for (let i = 0; i < rep.count; i++) {
+          let icon = rep.itemAt(i)
+          icon.grabToImage(function(result) {
+            result.saveToFile("$work/icon-" + icon.iconSize + ".png")
+            panel.grabbed++
+          })
+        }
+      }
+    }
+  }
+}
+QML
+
+if ! ( cd "$work" && QML_IMPORT_PATH="$work/import" timeout 20 qs -p "$work" >"$work/log" 2>&1 ); then
+  printf 'render failed:\n' >&2
+  sed -n '1,20p' "$work/log" >&2
+  exit 1
+fi
+
+failures=0
+fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
+
+# Width is the silhouette ratio (1.947 H), the terminal gap (0.057 H) and the
+# visible nub (0.163 H) rounded to whole pixels; height is the body itself.
+for size in 11 13 18; do
+  file="$work/icon-$size.png"
+  [[ -s $file ]] || { fail "$size px: no render produced"; continue; }
+
+  read -r width height <<<"$(magick identify -format '%w %h' "$file")"
+  expected_width=$(awk -v s="$size" 'BEGIN { printf "%d", s * (1.947 + 0.057 + 0.163) + 0.5 }')
+  [[ $width == "$expected_width" ]] || fail "$size px: width $width, expected $expected_width"
+  [[ $height == "$size" ]] || fail "$size px: height $height, expected $size"
+
+  mean=$(magick "$file" -alpha extract -format '%[fx:mean]' info:)
+  awk -v m="$mean" 'BEGIN { exit !(m > 0.05) }' ||
+    fail "$size px: glyph is blank (alpha coverage $mean)"
+
+  nub=$(magick "$file" -gravity east -crop "$(awk -v s="$size" 'BEGIN { printf "%d", s * 0.163 + 2 }')x${height}+0+0" +repage \
+    -alpha extract -format '%[fx:mean]' info:)
+  awk -v m="$nub" 'BEGIN { exit !(m > 0.02) }' ||
+    fail "$size px: terminal nub missing (coverage $nub)"
+done
+
+if (( failures > 0 )); then
+  printf '%d geometry check(s) failed\n' "$failures" >&2
+  exit 1
+fi
+
+printf 'icon geometry OK at 11, 13 and 18 px\n'

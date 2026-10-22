@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "id": "thepathless.omabattery",
-  "name": "OmaBattery",
-  "version": "1.1.0",
+  "id": "thepathless.juice",
+  "name": "Juice",
+  "version": "1.2.0",
   "author": "thepathless",
   "description": "Bespoke animated battery widget with hardware charge targets (80% / 100%) and compact telemetry dashboard",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "OmaBattery",
+    "displayName": "Juice",
     "description": "Hardware charge targets and detailed battery health",
     "category": "System",
     "allowMultiple": false,
@@ -22,9 +22,36 @@
       {
         "key": "showPercentage",
         "type": "boolean",
-        "label": "Show percentage",
-        "description": "Show the battery level next to the bar icon, in the icon's colour.",
+        "label": "Percentage inside the battery",
+        "description": "Print the level inside the battery body, the way iOS 16+ does, instead of beside it.",
         "defaultValue": false
+      },
+      {
+        "key": "iconSize",
+        "type": "integer",
+        "label": "Bar icon height",
+        "description": "Height of the battery in the status bar (Apple standard is 12–14px).",
+        "min": 11,
+        "max": 18,
+        "step": 1,
+        "defaultValue": 13
+      },
+      {
+        "key": "borderless",
+        "type": "boolean",
+        "label": "iOS 27 borderless body",
+        "description": "Draw iOS 27's filled capsule — no outline, the body itself carries the track, fill flush to the edge — instead of the bordered iOS 16–26 style.",
+        "defaultValue": false
+      },
+      {
+        "key": "redThreshold",
+        "type": "integer",
+        "label": "Turn red at or below (%)",
+        "description": "Battery level at which the icon switches to Apple's red.",
+        "min": 5,
+        "max": 50,
+        "step": 5,
+        "defaultValue": 20
       },
       {
         "key": "powerSaverThreshold",

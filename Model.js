@@ -1,9 +1,9 @@
-// Model helpers for OmaBattery.
+// Model helpers for Juice.
 //
 // The first half is the stock omarchy.power Model.js (profile picking, icon
-// selection, threshold detection) kept byte-for-byte in behaviour so the panel
-// looks and behaves exactly like the built-in one. The second half adds the
-// formatting used by the charge-target controls and the battery health section.
+// selection); its charge-threshold heuristic is replaced by the exact on-AC /
+// limit boundary below. The second half adds the formatting used by the
+// charge-target controls and the battery health section.
 
 function clampIndex(index, length) {
   if (length <= 0) return 0
@@ -56,22 +56,23 @@ function batteryFraction(device) {
   return device && device.isPresent ? Math.max(0, Math.min(1, device.percentage)) : 0
 }
 
-function chargeThresholdActive(device, onBattery, states) {
+// A charge limit is only holding when the machine is on AC and the pack has
+// actually reached limit - 1 (the EC counts in whole percent, so the boundary
+// can report one below the limit). Nothing about time-to-full or the charge
+// rate takes part: below the limit the current is still flowing and the state
+// must say so.
+function chargeThresholdActive(device, onBattery, chargeLimit) {
   var d = device || {}
-  var s = states || {}
-  if (!(d && d.isPresent && !onBattery)) return false
+  if (!(d && d.isPresent) || onBattery) return false
 
-  var fraction = batteryFraction(d)
-  if (d.state === s.Discharging) return false
-  if (d.state === s.PendingCharge) return true
-  if (d.state === s.FullyCharged && fraction < 0.99) return true
-  if (d.state !== s.Charging || fraction >= 0.99) return false
+  var limit = Number(chargeLimit)
+  if (!isFinite(limit) || limit <= 0 || limit >= 100) return false
 
-  return Number(d.changeRate || 0) <= 0.2 || Number(d.timeToFull || 0) >= 8 * 60 * 60
+  return batteryLevel(d) >= limit - 1
 }
 
-function batteryIcon(device, onBattery, states, sysfsStatus) {
-  return batteryIconForState(batteryState(device, onBattery, states, sysfsStatus), batteryLevel(device), onBattery)
+function batteryIcon(device, onBattery, chargeLimit) {
+  return batteryIconForState(batteryState(device, onBattery, chargeLimit), batteryLevel(device), onBattery)
 }
 
 // ------------------------------------------------------------- bar state ---
@@ -90,41 +91,47 @@ function batteryLevel(device) {
 }
 
 // "charging" while current flows in, "full" at the top, "plugged" when on AC
-// but not charging (holding at a charge threshold, or waiting to top up), and
-// "discharging" when the battery is the source. "absent" on desktops.
-function batteryState(device, onBattery, states, sysfsStatus) {
+// holding at the charge limit, and "discharging" when the battery is the
+// source. "absent" on desktops. The limit only matters on AC: off AC the pack
+// is the source no matter where it sits relative to the limit.
+function batteryState(device, onBattery, chargeLimit) {
   var d = device || {}
-  var s = states || {}
   if (!d.isPresent) return "absent"
 
-  var level = batteryLevel(d)
-
-  // The kernel attribute flips the instant the embedded controller changes what
-  // it is doing, while UPower only learns about it on its next poll. Prefer the
-  // sysfs status whenever the probe has one, so the bar cannot show "charging"
-  // for half a minute after the EC stopped.
-  var status = trim(sysfsStatus).toLowerCase()
-  if (status === "charging") return "charging"
-  if (status === "full" || status === "fully charged") return "full"
-  if (status === "not charging") return level >= 100 ? "full" : "plugged"
-  if (status === "discharging") return "discharging"
-
-  if (!onBattery) {
-    if (d.state === s.Charging) return "charging"
-    if (d.state === s.FullyCharged) return "full"
-    if (level >= 100) return "full"
-    return "plugged"
-  }
-  if (d.state === s.FullyCharged) return "full"
-  return "discharging"
+  if (onBattery) return "discharging"
+  if (batteryLevel(d) >= 100) return "full"
+  if (chargeThresholdActive(d, onBattery, chargeLimit)) return "plugged"
+  return "charging"
 }
 
 function stateLabel(state, level) {
   if (state === "charging") return "Charging"
   if (state === "full") return "Fully charged"
-  if (state === "plugged") return "Plugged in, not charging"
+  if (state === "plugged") return "Plugged in"
   if (state === "discharging") return level >= 0 ? "On battery, " + level + "%" : "On battery"
   return ""
+}
+
+// The sentence under the charge bar: the same state, spelled out with the
+// charge limit when the hardware exposes one. It reads nothing but the derived
+// state, so an unknown or stale kernel status can never contradict the glyph.
+function stateDetailLabel(state, level, limit) {
+  var cap = number(limit)
+  var hasLimit = cap >= 0
+  var suffix = hasLimit ? " · limit " + cap + "%" : ""
+  if (state === "charging") return "Charging" + suffix
+  if (state === "plugged") return "Holding at the " + cap + "% limit (EC bypasses to AC)"
+  if (state === "full") return "Fully charged" + suffix
+  if (state === "discharging") return "Discharging" + suffix
+  return ""
+}
+
+// Which phrase set the hero may rotate: current flowing in, flowing out, or
+// neither (full, holding at the limit, no battery).
+function flowKind(state) {
+  if (state === "charging") return "in"
+  if (state === "discharging") return "out"
+  return "idle"
 }
 
 function batteryIconForState(state, level, onBattery) {
@@ -143,23 +150,98 @@ function batteryIconForState(state, level, onBattery) {
   return defaultIcons[index]
 }
 
-// Two-step escalation for the bar: the theme's yellow from `low` down to the
-// critical band, its red strictly below `critical`, and the normal bar colour
-// otherwise. `critical` is exclusive so 25 with low=50/critical=25 is still
-// yellow and the red band begins at 24.
-function levelColor(level, low, critical, lowColor, criticalColor, normalColor) {
-  if (level < 0) return normalColor
-  if (level < critical) return criticalColor
-  if (level <= low) return lowColor
+// Colour for the bar glyph, in Apple's precedence: Low Power Mode (yellow) is
+// a mode indicator and outranks everything, then the low-battery red, then
+// green while power flows in, then the bar's own colour. The threshold is
+// inclusive, matching "20% or lower". `full` counts as charged, exactly as
+// the reference widget treats it, so a topped-up battery on AC is green.
+function iconColor(state, level, saverActive, redBelow, normalColor, greenColor, yellowColor, redColor) {
+  var pct = number(level)
+  if (state === "absent") return normalColor
+  if (saverActive === true) return yellowColor
+  if (pct >= 0 && pct <= number(redBelow)) return redColor
+  if (state === "charging" || state === "full") return greenColor
   return normalColor
 }
 
-// Percentage at which the power-saver profile should engage, clamped to a
-// range where it is meaningful, falling back to 50.
-function powerSaverThreshold(raw, fallback) {
+// True while the percentage should be punched through the fill. Apple drops
+// the cut-out for charging, critical and power-saver states because a hole is
+// unreadable over green/red/yellow; those states draw solid digits instead.
+function knockoutText(state, level, saverActive, redBelow) {
+  var pct = number(level)
+  if (state === "charging" || state === "full" || state === "absent") return false
+  if (saverActive === true) return false
+  return pct > number(redBelow)
+}
+
+// ---- settings ranges ------------------------------------------------------
+// One table for the values each setting may take. The manifest declares the
+// same bounds for the plugin's settings dialog and the bar clamps to them, so a
+// panel row can enumerate exactly what the schema allows instead of keeping its
+// own shortlist that silently drifts from it.
+var settingRanges = {
+  iconSize: { min: 11, max: 18, step: 1, fallback: 13 },
+  redThreshold: { min: 5, max: 50, step: 5, fallback: 20 },
+  powerSaverThreshold: { min: 5, max: 95, step: 5, fallback: 50 }
+}
+
+function settingRange(key) {
+  return settingRanges[key] || { min: 0, max: 0, step: 1, fallback: 0 }
+}
+
+function clampSetting(key, raw, fallback) {
+  var range = settingRange(key)
   var n = parseInt(raw, 10)
-  if (isNaN(n)) n = fallback
-  return Math.max(5, Math.min(95, n))
+  if (isNaN(n)) n = fallback === undefined ? range.fallback : fallback
+  return Math.max(range.min, Math.min(range.max, n))
+}
+
+// Every value the range admits, ascending: the panel's cycle ring.
+function rangeSteps(key) {
+  var range = settingRange(key)
+  var steps = []
+  if (!(range.step > 0)) return [range.min]
+  for (var v = range.min; v <= range.max; v += range.step) steps.push(v)
+  return steps
+}
+
+function cycleSetting(key, current) {
+  return nextStep(rangeSteps(key), current)
+}
+
+// Settings arrive as JSON values from the panel but as strings from
+// `omarchy bar set`, so one parser has to read both or the two writes disagree.
+function boolSetting(raw, fallback) {
+  if (raw === true || raw === false) return raw
+  if (raw === undefined || raw === null) return fallback
+  var s = String(raw).trim().toLowerCase()
+  if (s === "true" || s === "1" || s === "on" || s === "yes") return true
+  if (s === "false" || s === "0" || s === "off" || s === "no") return false
+  return fallback
+}
+
+// Low-battery threshold in percent, clamped to the range the schema declares.
+function redThreshold(raw, fallback) {
+  return clampSetting("redThreshold", raw, fallback)
+}
+
+// Body height of the bar glyph in logical pixels: below 11 the digits have no
+// room, above 18 it stops looking like a status bar icon.
+function iconHeight(raw, fallback) {
+  return clampSetting("iconSize", raw, fallback)
+}
+
+// Next value in a ring, used by the panel's cycling controls.
+function nextStep(steps, current) {
+  var list = Array.isArray(steps) ? steps : []
+  if (list.length === 0) return current
+  var index = list.indexOf(Number(current))
+  return list[(index + 1) % list.length]
+}
+
+// Percentage at which the power-saver profile should engage.
+function powerSaverThreshold(raw, fallback) {
+  return clampSetting("powerSaverThreshold", raw, fallback)
 }
 
 // Only escalate when the battery is actually the power source, and step back
@@ -176,16 +258,6 @@ function wantPowerSaverRelease(onBattery, level, threshold, hysteresis) {
   return level > threshold + (hysteresis || 0)
 }
 
-function modeLabel(device, onBattery, states) {
-  var d = device || {}
-  if (!d.isPresent) return ""
-
-  var percentage = d.isPresent ? d.percentage : 0
-  if (chargeThresholdActive(d, onBattery, states)) return "Threshold"
-  if (onBattery) return "On battery"
-  if (!onBattery && percentage >= 1) return "Fully charged"
-  return "Charging"
-}
 
 // ---------------------------------------------------------------- numbers ---
 
@@ -241,6 +313,38 @@ function formatCount(value) {
   var n = number(value)
   if (n < 0) return "—"
   return String(Math.round(n))
+}
+
+// "2h 14m" / "48m" / "" for an unknown estimate.
+function formatDuration(seconds) {
+  var s = number(seconds)
+  if (!(s > 0)) return ""
+  var minutes = Math.round(s / 60)
+  if (minutes < 1) return "<1m"
+  var hours = Math.floor(minutes / 60)
+  var rest = minutes % 60
+  if (hours === 0) return rest + "m"
+  if (rest === 0) return hours + "h"
+  return hours + "h " + rest + "m"
+}
+
+// UPower's own estimate, as the sentence the panel prints under the level.
+function timeRemainingLabel(state, toEmpty, toFull) {
+  if (state === "charging") {
+    var full = formatDuration(toFull)
+    return full === "" ? "" : full + " to full"
+  }
+  if (state === "discharging") {
+    var left = formatDuration(toEmpty)
+    return left === "" ? "" : left + " left"
+  }
+  return ""
+}
+
+// "LGC 5B10W13931" — or an em dash when the firmware exposes neither.
+function deviceName(manufacturer, model) {
+  var parts = [trim(manufacturer), trim(model)].filter(function(part) { return part !== "" })
+  return parts.length > 0 ? parts.join(" ") : "—"
 }
 
 // Current is not always exposed directly; power and voltage usually are.
@@ -306,15 +410,6 @@ function limitStartLabel(start) {
 
 // Live sentence under the buttons: always built from the last probe, never from
 // what we asked the hardware to do.
-function chargeStateLabel(status, end, onAc) {
-  var state = trim(status)
-  var e = number(end)
-  var limit = e >= 0 ? e + "%" : "unknown"
-  if (state === "") return onAc ? "On AC · limit " + limit : "On battery · limit " + limit
-  if (state === "Not charging") return "Holding at the " + limit + " limit (EC bypasses to AC)"
-  if (state === "Full" || state === "Fully charged") return "Fully charged · limit " + limit
-  return state.charAt(0).toUpperCase() + state.slice(1) + " · limit " + limit
-}
 
 if (typeof module !== "undefined") {
   module.exports = {
@@ -329,12 +424,21 @@ if (typeof module !== "undefined") {
     batteryLevel: batteryLevel,
     batteryState: batteryState,
     stateLabel: stateLabel,
+    stateDetailLabel: stateDetailLabel,
+    flowKind: flowKind,
     batteryIconForState: batteryIconForState,
-    levelColor: levelColor,
+    iconColor: iconColor,
+    knockoutText: knockoutText,
+    redThreshold: redThreshold,
+    iconHeight: iconHeight,
+    settingRange: settingRange,
+    rangeSteps: rangeSteps,
+    cycleSetting: cycleSetting,
+    boolSetting: boolSetting,
+    nextStep: nextStep,
     powerSaverThreshold: powerSaverThreshold,
     wantPowerSaver: wantPowerSaver,
     wantPowerSaverRelease: wantPowerSaverRelease,
-    modeLabel: modeLabel,
     number: number,
     trim: trim,
     formatEnergy: formatEnergy,
@@ -343,13 +447,15 @@ if (typeof module !== "undefined") {
     formatVolts: formatVolts,
     formatCelsius: formatCelsius,
     formatCount: formatCount,
+    formatDuration: formatDuration,
+    timeRemainingLabel: timeRemainingLabel,
+    deviceName: deviceName,
     currentFromPower: currentFromPower,
     batteryHealth: batteryHealth,
     healthFraction: healthFraction,
     healthGrade: healthGrade,
     wear: wear,
     limitModeLabel: limitModeLabel,
-    limitStartLabel: limitStartLabel,
-    chargeStateLabel: chargeStateLabel
+    limitStartLabel: limitStartLabel
   }
 }

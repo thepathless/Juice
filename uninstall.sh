@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OmaBattery uninstaller.
+# Juice uninstaller.
 #
 # Removes what install.sh added: the user systemd unit, the plugin symlink (only
 # when it points at this checkout) and, with root, the udev rule. It never
@@ -15,8 +15,8 @@ set -euo pipefail
 PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PLUGINS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-UNIT_NAME="omabattery-charge-target.service"
-UDEV_DST="/etc/udev/rules.d/99-omabattery-charge-thresholds.rules"
+UNIT_NAME="juice-charge-target.service"
+UDEV_DST="/etc/udev/rules.d/99-juice-charge-thresholds.rules"
 
 KEEP_UDEV=0
 for arg in "$@"; do
@@ -41,7 +41,7 @@ command -v jq >/dev/null 2>&1 || {
 PLUGIN_ID="$(jq -r '.id' "$PLUGIN_DIR/manifest.json")"
 TARGET="$PLUGINS_DIR/$PLUGIN_ID"
 
-printf '\nOmaBattery uninstaller\n'
+printf '\nJuice uninstaller\n'
 
 # --- 1. disable the plugin in the bar ---------------------------------------
 

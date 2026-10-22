@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -8,7 +9,7 @@ import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
-// OmaBattery — battery bar widget and panel.
+// Juice — battery bar widget and panel.
 //
 // This is a clone of Omarchy's built-in omarchy.power panel: the bar button,
 // hero, charge bar, stats row, power-profile picker, keyboard handling, theming
@@ -17,16 +18,15 @@ import "Model.js" as Model
 // added:
 //
 //   1. CHARGE LIMIT — writes the kernel charge thresholds (80% / 100%) through
-//      scripts/omabattery-set-limit and always reports what the hardware
+//      scripts/juice-set-limit and always reports what the hardware
 //      actually holds, never what we asked for.
-//   2. BATTERY HEALTH — the detailed sysfs telemetry (health, cycles, capacity,
-//      voltage, power, time estimates) rendered with the same InfoPair /
-//      PanelSectionHeader / PanelSeparator primitives the rest of the panel
-//      uses, so it reads as part of the theme rather than a new visual language.
+//   2. BATTERY DETAIL — the detailed sysfs telemetry in a fixed-height iOS
+//      inset card with HEALTH | POWER | SPECS tabs, so all eighteen values
+//      live on one page without scrolling.
 Panel {
   id: root
-  moduleName: "thepathless.omabattery"
-  ipcTarget: "thepathless.omabattery"
+  moduleName: "thepathless.juice"
+  ipcTarget: "thepathless.juice"
   // manageIpc: false so this panel can own the single IpcHandler the target
   // permits — needed for the charge-target and togglePercentage methods below.
   manageIpc: false
@@ -36,19 +36,15 @@ Panel {
   property string activeProfile: ""
   property int profileIndex: 0
   property bool cursorActive: false
-  readonly property bool showPercentage: setting("showPercentage", false) === true
-  // With the percentage shown the button paints a text block wider than an
-  // icon, so the open-panel mark takes the painted width instead of the
-  // icon-sized fraction of the slot the fallback assumes.
-  readonly property real openPanelIndicatorWidth: showPercentage && !button.vertical ? button.width : 0
+  readonly property bool showPercentage: Model.boolSetting(setting("showPercentage", false), false)
   readonly property bool batteryPresent: {
     var device = UPower.displayDevice
     return !!(device && device.isPresent)
   }
 
-  // ---- OmaBattery: sysfs telemetry, charge targets -------------------------
+  // ---- Juice: sysfs telemetry, charge targets ------------------------------
   //
-  // statsInfo holds the last successful probe (see scripts/omabattery-stats).
+  // statsInfo holds the last successful probe (see scripts/juice-stats).
   // It is the only source for the threshold and health numbers, so the panel
   // can never show an assumed value.
   property var statsInfo: ({})
@@ -57,13 +53,18 @@ Panel {
   property bool limitFeedbackError: false
   property int verifyAttempts: 0
 
-  // ---- OmaBattery: bar presentation and options ---------------------------
+  // ---- Juice: bar presentation and options --------------------------------
   //
   // The bar glyph and its colour are pure functions of the UPower device (see
   // Model.batteryState), bound rather than polled, so the icon changes at the
   // same moment the compositor sees the state change.
-  property color warningColor: Commons.Color.bar.active
-  property color criticalColor: Commons.Color.urgent
+  //
+  // Apple's system colours, dark appearance values. They are fixed rather than
+  // read from colors.toml because the theme's red/yellow/green are often
+  // grayscale (this one is), which made every "warning" colour the same grey.
+  readonly property color appleGreen: "#30D158"
+  readonly property color appleYellow: "#FFD60A"
+  readonly property color appleRed: "#FF453A"
   property bool autoSaverEngaged: false
   // Profile the user was running before the saver was engaged, so releasing
   // restores exactly that instead of guessing from stored preferences.
@@ -72,22 +73,44 @@ Panel {
   property bool statsDirty: false
 
   readonly property int batteryLevel: Model.batteryLevel(UPower.displayDevice)
-  readonly property string batteryState: Model.batteryState(UPower.displayDevice, root.discharging, upowerStates(), root.statsInfo.status)
+  readonly property string batteryState: Model.batteryState(UPower.displayDevice, root.onBattery, root.chargeLimitEnd)
   readonly property string batteryStateText: Model.stateLabel(root.batteryState, root.batteryLevel)
-  // Colour bands requested for this machine: the normal bar colour above 50%,
-  // the theme's yellow from 50% down to 25%, and its red below 25%.
-  readonly property int lowBatteryThreshold: 50
-  readonly property int criticalBatteryThreshold: 25
-  readonly property color barIconColor: Model.levelColor(
-    root.batteryLevel, root.lowBatteryThreshold, root.criticalBatteryThreshold,
-    root.warningColor, root.criticalColor,
-    root.bar ? root.bar.barForeground : Commons.Color.foreground)
+  // Apple's rules: red under the low threshold, yellow while Low Power Mode
+  // (power-saver) is the active profile, green while current flows in, theme
+  // foreground the rest of the time. The threshold is user-tunable.
+  readonly property int redBatteryThreshold: Model.redThreshold(setting("redThreshold", 20), 20)
+  readonly property bool powerSaverActive: PowerProfiles.profile === PowerProfile.PowerSaver
+  readonly property color barIconColor: Model.iconColor(
+    root.batteryState, root.batteryLevel, root.powerSaverActive, root.redBatteryThreshold,
+    root.bar ? root.bar.barForeground : Commons.Color.foreground,
+    root.appleGreen, root.appleYellow, root.appleRed)
+  // Body height in logical pixels; every other glyph dimension comes from
+  // BatteryIcon's own Apple-derived ratios, so the slot never restates them.
+  readonly property int barIconHeight: Model.iconHeight(setting("iconSize", 13), 13)
+  // iOS 27's capsule is opt-in: it is a different body, not a tweak, so the
+  // bordered glyph stays the default.
+  readonly property bool borderlessStyle: Model.boolSetting(setting("borderless", false), false)
+  readonly property real barGlyphHeight: Style.spaceReal(root.barIconHeight)
+  readonly property real barGlyphWidth: barGlyph.implicitWidth
+  // The hole in the fill is painted in the surface the bar puts behind the
+  // battery. A plugin only sees `bar.background` (the theme's base colour,
+  // and always opaque) plus `bar.transparent`; a glassy bar exposes no flag,
+  // and its 35 % tint of that same colour stays within a few levels of it on
+  // this palette, so the base colour is the closest the facade offers. A
+  // clear bar has no surface to punch out of at all, and the digits take the
+  // theme background rather than painting the fill away.
+  readonly property color barCutoutColor: root.bar && root.bar.transparent !== true
+    ? root.bar.background
+    : Commons.Color.background
+  readonly property string timeRemainingText: Model.timeRemainingLabel(
+    root.batteryState, UPower.displayDevice ? UPower.displayDevice.timeToEmpty : 0,
+    UPower.displayDevice ? UPower.displayDevice.timeToFull : 0)
   readonly property int powerSaverThreshold: Model.powerSaverThreshold(setting("powerSaverThreshold", 50), 50)
 
   readonly property string statsScript: decodeURIComponent(
-    Qt.resolvedUrl("scripts/omabattery-stats").toString().replace(/^file:\/\//, ""))
+    Qt.resolvedUrl("scripts/juice-stats").toString().replace(/^file:\/\//, ""))
   readonly property string limitScript: decodeURIComponent(
-    Qt.resolvedUrl("scripts/omabattery-set-limit").toString().replace(/^file:\/\//, ""))
+    Qt.resolvedUrl("scripts/juice-set-limit").toString().replace(/^file:\/\//, ""))
 
   readonly property bool statsLoaded: statsInfo.capacity !== undefined
   readonly property int chargeLimitEnd: {
@@ -100,22 +123,14 @@ Panel {
   }
   readonly property bool chargeLimitSupported: root.chargeLimitEnd >= 0
   readonly property bool acOnline: root.statsInfo.ac_online === "1"
-  readonly property string hardwareStatus: root.statsInfo.status || ""
   readonly property string energyUnit: root.statsInfo.unit || "Wh"
   readonly property real healthPercent: Model.batteryHealth(root.statsInfo.energy_full, root.statsInfo.energy_full_design)
   readonly property real healthFraction: Model.healthFraction(root.statsInfo.energy_full, root.statsInfo.energy_full_design)
   readonly property string healthGrade: Model.healthGrade(root.healthPercent)
-  // Live sentence built from the last probe: the truth about the hardware.
-  readonly property string chargeStateText: Model.chargeStateLabel(root.hardwareStatus, root.chargeLimitEnd, root.acOnline)
-
-  function upowerStates() {
-    return {
-      Charging: UPowerDeviceState.Charging,
-      Discharging: UPowerDeviceState.Discharging,
-      FullyCharged: UPowerDeviceState.FullyCharged,
-      PendingCharge: UPowerDeviceState.PendingCharge
-    }
-  }
+  // The subtitle under the charge bar, built from the same derived state and
+  // limit the glyph uses, so the sentence can never contradict the icon.
+  readonly property string chargeStateText: Model.stateDetailLabel(
+    root.batteryState, root.batteryLevel, root.chargeLimitEnd)
 
   function selectProfileByDelta(delta) {
     profileIndex = Model.selectProfileIndex(profileIndex, delta, profiles)
@@ -128,46 +143,24 @@ Panel {
 
   function batteryIcon() {
     var device = UPower.displayDevice
-    return Model.batteryIcon(device, root.discharging, upowerStates(), root.statsInfo.status)
-  }
-
-  function modeLabel() {
-    var device = UPower.displayDevice
-    return Model.modeLabel(device, root.discharging, upowerStates())
+    return Model.batteryIcon(device, root.onBattery, root.chargeLimitEnd)
   }
 
   function profileIcon(name) {
     return Model.profileIcon(name)
   }
 
-  readonly property bool fullyCharged: {
-    var device = UPower.displayDevice
-    return device && device.isPresent && device.state === UPowerDeviceState.FullyCharged && !root.chargeThresholdActive
-  }
-  readonly property bool discharging: {
-    var device = UPower.displayDevice
-    return !!(device && device.isPresent && UPower.onBattery)
-  }
-  readonly property bool chargeThresholdActive: {
-    var device = UPower.displayDevice
-    return Model.chargeThresholdActive(device, root.discharging, upowerStates())
-  }
-  readonly property bool batteryFull: fullyCharged || (!root.discharging && batteryFraction >= 1)
-  readonly property bool batteryFlowIdle: batteryFull || chargeThresholdActive
+  // Raw input only: the pack is the power source. Every state-dependent
+  // boolean below is read off `batteryState`, so the Model stays the single
+  // owner of charging / plugged / full / discharging.
+  readonly property bool onBattery: UPower.onBattery
+  readonly property bool charging: root.batteryState === "charging"
+  readonly property string flowKind: Model.flowKind(root.batteryState)
 
   // 0..1 charge level, used by the visual progress bar.
   readonly property real batteryFraction: {
     var d = UPower.displayDevice
     return Model.batteryFraction(d)
-  }
-
-  readonly property bool charging: {
-    var d = UPower.displayDevice
-    return d && d.isPresent && !UPower.onBattery && !root.batteryFlowIdle
-  }
-
-  readonly property color batteryFillColor: {
-    return root.bar ? root.bar.foreground : Commons.Color.foreground
   }
 
   // Cute agent-flavored phrases shown in the hero status line, rotated on a
@@ -198,18 +191,15 @@ Panel {
 
   // Whichever list is "active" given the current power state.
   readonly property var activePhrases: {
-    if (fullyCharged) return []
-    if (charging) return chargingPhrases
-    if (discharging) return onBatteryPhrases
+    if (root.flowKind === "in") return chargingPhrases
+    if (root.flowKind === "out") return onBatteryPhrases
     return []
   }
   readonly property bool rotatingPhrases: activePhrases.length > 0
 
-  readonly property string heroStatusText: {
-    if (fullyCharged) return "Fully charged"
-    if (rotatingPhrases) return activePhrases[phraseIndex % activePhrases.length]
-    return modeLabel()
-  }
+  readonly property string heroStatusText: rotatingPhrases
+    ? activePhrases[phraseIndex % activePhrases.length]
+    : Model.stateLabel(root.batteryState, root.batteryLevel)
 
   function refresh() {
     if (!batteryPresent) return
@@ -249,7 +239,7 @@ Panel {
 
   function setProfile(profile) {
     if (!profile || actionProc.running) return
-    actionProc.command = ["omarchy-powerprofiles-set", root.discharging ? "battery" : "ac", profile]
+    actionProc.command = ["omarchy-powerprofiles-set", root.onBattery ? "battery" : "ac", profile]
     actionProc.running = true
   }
 
@@ -266,6 +256,12 @@ Panel {
     root.updateSetting("showPercentage", !root.showPercentage)
   }
 
+  // Numbers commit on Return and hand the keyboard back to the panel, so
+  // Escape and the arrow-key profile picker keep working afterwards.
+  function releaseFieldFocus() {
+    if (keyCatcher) keyCatcher.forceActiveFocus()
+  }
+
   // Bar-widget options live in this widget's inline shell.json entry — the same
   // place Omarchy stores every other bar setting. Writing the whole entry back
   // through the shell is what makes the choice survive a restart.
@@ -276,7 +272,7 @@ Panel {
     if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, next)
   }
 
-  // ---- OmaBattery: power-saver automation ---------------------------------
+  // ---- Juice: power-saver automation --------------------------------------
 
   // Engages power-saver when the battery drops to the configured level, and
   // releases it a few points above that so the profile does not flap at the
@@ -305,7 +301,7 @@ Panel {
 
   onPowerSaverThresholdChanged: root.evaluatePowerSaver()
 
-  // ---- OmaBattery: charge targets -----------------------------------------
+  // ---- Juice: charge targets ----------------------------------------------
 
   function notify(headline, body) {
     Quickshell.execDetached(["omarchy-notification-send", "-g", "󰂅", headline, body])
@@ -349,7 +345,7 @@ Panel {
   }
 
   IpcHandler {
-    target: "thepathless.omabattery"
+    target: "thepathless.juice"
 
     function open() { root.open() }
     function close() { root.close() }
@@ -359,9 +355,15 @@ Panel {
     function togglePercentage() { root.togglePercentage() }
     // IPC arguments arrive as literal strings (omarchy-shell <target> <method> <arg>).
     function setShowPercentage(on: string): string {
-      var enabled = on === "true" || on === "1"
+      var enabled = Model.boolSetting(on, false)
       root.updateSetting("showPercentage", enabled)
       return enabled ? "on" : "off"
+    }
+
+    function setRedThreshold(value: string): string {
+      var next = Model.redThreshold(value, root.redBatteryThreshold)
+      root.updateSetting("redThreshold", next)
+      return String(next)
     }
 
     function setPowerSaverThreshold(value: string): string {
@@ -375,11 +377,17 @@ Panel {
         state: root.batteryState,
         icon: root.batteryIcon(),
         color: String(root.barIconColor),
-        warning: String(root.warningColor),
-        critical: String(root.criticalColor),
+
+        green: String(root.appleGreen),
+        yellow: String(root.appleYellow),
+        red: String(root.appleRed),
+        redBelow: root.redBatteryThreshold,
+        iconSize: root.barIconHeight,
+        powerSaver: root.powerSaverActive,
         limit: root.chargeLimitEnd,
         statsLoaded: root.statsLoaded,
         showPercentage: root.showPercentage,
+        borderless: root.borderlessStyle,
         powerSaverThreshold: root.powerSaverThreshold,
         autoSaverEngaged: root.autoSaverEngaged
       })
@@ -391,6 +399,10 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      // A reopened panel always starts on HEALTH; switching tabs inside one
+      // open session still persists.
+      detailTab = 0
+
       if (!batteryPresent) {
         close()
         return
@@ -506,42 +518,7 @@ Panel {
   // before the panel is opened for the first time.
   Component.onCompleted: {
     root.refreshStats()
-    root.applyThemeWarningColors("")
     root.evaluatePowerSaver()
-  }
-
-  // Low/critical colours come from the active theme's own palette — the same
-  // colors.toml Commons/Color.qml reads — so the escalation stays on-theme
-  // instead of hardcoding a yellow and a red. Falls back to the shell's alert
-  // roles when a theme does not define them.
-  function applyThemeWarningColors(raw) {
-    var lines = String(raw || "").split("\n")
-    var yellow = ""
-    var red = ""
-    for (var i = 0; i < lines.length; i++) {
-      var match = lines[i].match(/^\s*(yellow|red)\s*=\s*["']?(#[0-9A-Fa-f]{6})/)
-      if (!match) continue
-      if (match[1] === "yellow") yellow = match[2]
-      else red = match[2]
-    }
-    root.warningColor = yellow !== "" ? yellow : Commons.Color.bar.active
-    root.criticalColor = red !== "" ? red : Commons.Color.urgent
-  }
-
-  FileView {
-    id: themeColors
-    path: Commons.Color.currentThemePath + "/colors.toml"
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.applyThemeWarningColors(text())
-    onFileChanged: reload()
-  }
-
-  // A theme switch rewrites that file; reload when the shell's palette moves
-  // so the warning colours follow the new theme immediately.
-  Connections {
-    target: Commons.Color
-    function onForegroundChanged() { themeColors.reload() }
   }
 
   // Power-saver automation is driven by UPower notifications, not a poll.
@@ -608,35 +585,55 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    labelText: root.showPercentage && !vertical && root.batteryLevel >= 0
-      ? root.batteryLevel + "%"
-      : ""
-    slotSize: Style.bar.iconSlot * (root.showPercentage && !vertical ? 2 : 1)
+    slotSize: button.vertical ? root.barGlyphWidth + Style.space(4) : root.barGlyphWidth + Style.space(6)
     foreground: root.barIconColor
     tooltipText: root.batteryStateText
-    iconComponent: Component {
-      Item {
-        BatteryIcon {
-          x: Math.round((parent.width - width) / 2)
-          y: Math.round((parent.height - height) / 2)
-          iconSize: button.iconSize
-          level: root.batteryLevel
-          charging: root.charging
-          holding: root.chargeThresholdActive
-          acOnline: root.acOnline
-          color: root.barIconColor
-          pulseCharging: true
-        }
-      }
-    }
+      + (root.showPercentage || root.batteryLevel < 0 ? "" : " · " + root.batteryLevel + "%")
+    // BarIconContent scales every iconComponent into Style.bar.iconSize (12px
+    // on this shell), which is exactly why the old glyph looked tiny. The empty
+    // item keeps the button's "has visual content" true while the real glyph,
+    // a child below, is drawn at its own size and only the slot reserves room.
+    iconComponent: Component { Item {} }
     onPressed: function(b) {
       if (!root.batteryPresent) return
       if (b === Qt.RightButton) root.togglePercentage()
       else root.toggle()
     }
+
+    Item {
+      id: barGlyph
+      anchors.centerIn: parent
+      // A horizontal battery in a vertical bar is turned on its side so it
+      // still fits the bar's width.
+      implicitWidth: icon.implicitWidth
+      implicitHeight: icon.implicitHeight
+      width: button.vertical ? root.barGlyphHeight : root.barGlyphWidth
+      height: button.vertical ? root.barGlyphWidth : root.barGlyphHeight
+
+      BatteryIcon {
+        id: icon
+        anchors.centerIn: parent
+        rotation: button.vertical ? 90 : 0
+        iconSize: root.barGlyphHeight
+        fontFamily: root.bar ? root.bar.fontFamily : ""
+        level: root.batteryLevel
+        charging: root.charging
+        color: root.barIconColor
+        contentColor: root.bar ? root.bar.barForeground : Commons.Color.foreground
+        cutoutColor: root.barCutoutColor
+        showPercentage: root.showPercentage
+        borderless: root.borderlessStyle
+        knockoutText: Model.knockoutText(
+          root.batteryState, root.batteryLevel, root.powerSaverActive, root.redBatteryThreshold)
+        // Apple never prints the percent sign inside the pill: only the digits.
+        percentageText: root.batteryLevel >= 0 ? String(root.batteryLevel) : ""
+      }
+    }
   }
 
-  property bool showHardwareDetails: false
+  // Which detail tab is showing; the card keeps one fixed height so switching
+  // never reflows the rest of the dashboard.
+  property int detailTab: 0
 
   KeyboardPanel {
     id: panel
@@ -660,11 +657,33 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
+      // The card is capped to the space under the bar, and the dashboard is
+      // taller than that on a 1080p screen: without a scroll container the
+      // OPTIONS rows fall off the card and can't be clicked at all.
+      Flickable {
+        id: panelFlick
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar {
+          id: panelScroll
+          policy: ScrollBar.AsNeeded
+        }
+      }
+
+      // Declared next to the Flickable rather than nested inside it so the
+      // dashboard body keeps its own indentation; `parent` still makes it
+      // the scroll content.
       Column {
         id: column
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
+        parent: panelFlick.contentItem
+        // A scrolling panel needs its own strip for the bar rather than
+        // laying it over the right-aligned value chips.
+        width: panelFlick.width - (panelFlick.interactive ? panelScroll.width + Style.space(6) : 0)
         spacing: Style.space(12)
 
         // ---------- Hero: Bespoke Battery Card ----------
@@ -691,13 +710,14 @@ Panel {
               BatteryIcon {
                 id: heroIconVisual
                 Layout.alignment: Qt.AlignVCenter
-                iconSize: Style.space(22)
+                iconSize: Style.space(30)
+                fontFamily: root.bar.fontFamily
                 level: root.batteryLevel
                 charging: root.charging
-                holding: root.chargeThresholdActive
-                acOnline: root.acOnline
                 color: root.barIconColor
-                pulseCharging: true
+                contentColor: root.bar.foreground
+                cutoutColor: Commons.Color.popups.background
+                borderless: root.borderlessStyle
               }
 
               ColumnLayout {
@@ -723,6 +743,19 @@ Panel {
                   font.pixelSize: Style.font.caption
                   font.bold: true
                   font.letterSpacing: 0.8
+                  elide: Text.ElideRight
+                  Layout.fillWidth: true
+                }
+
+                // UPower's own estimate; Omarchy's `time` string is the
+                // fallback in the FLOW tile when UPower has nothing to say.
+                Text {
+                  textFormat: Text.PlainText
+                  visible: root.timeRemainingText !== ""
+                  text: root.timeRemainingText
+                  color: Qt.darker(root.bar.foreground, 1.3)
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
                   Layout.fillWidth: true
                 }
@@ -768,7 +801,7 @@ Panel {
               Rectangle {
                 height: parent.height
                 radius: height / 2
-                color: root.batteryFillColor
+                color: root.barIconColor
                 width: Math.max(parent.height, parent.width * root.batteryFraction)
 
                 Behavior on width { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
@@ -901,84 +934,89 @@ Panel {
           }
         }
 
-        // ---------- Hardware Telemetry (Bento Grid) ----------
+        // ---------- Battery detail (iOS inset card with segmented tabs) ----------
         Column {
           visible: root.statsLoaded
           width: parent.width
           spacing: Style.space(6)
 
-          Row {
-            width: parent.width
-            PanelSectionHeader {
-              text: "HARDWARE TELEMETRY"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-              width: parent.width - detailsToggle.implicitWidth
-            }
+          PanelSectionHeader {
+            text: "BATTERY DETAIL"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+          }
 
-            Text {
-              id: detailsToggle
-              anchors.verticalCenter: parent.verticalCenter
-              textFormat: Text.PlainText
-              text: root.showHardwareDetails ? "Less ▴" : "More ▾"
-              color: root.bar.foreground
-              opacity: 0.6
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.showHardwareDetails = !root.showHardwareDetails
+          Rectangle {
+            width: parent.width
+            height: detailTabs.height + detailBody.height + Style.space(27)
+            // Inset-grouped corner radius: 10 pt at 17 pt body, 0.588 here.
+            radius: Style.cornerRadius > 0 ? Math.min(6, Style.cornerRadius) : 6
+            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.03)
+            border.width: 1
+            border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
+
+            Column {
+              anchors.fill: parent
+              anchors.margins: Style.space(9)
+              spacing: Style.space(9)
+
+              DetailTabs {
+                id: detailTabs
+                width: parent.width
+                current: root.detailTab
+                onSelected: function(index) { root.detailTab = index }
+              }
+
+              // Every tab holds six rows, so the card height is fixed and
+              // switching tabs never moves anything else on the page.
+              Item {
+                id: detailBody
+                width: parent.width
+                height: detailHealth.implicitHeight
+
+                Column {
+                  id: detailHealth
+                  anchors.fill: parent
+                  visible: root.detailTab === 0
+                  spacing: 0
+
+                  DetailRow { label: "Maximum capacity"; value: root.healthPercent >= 0 ? root.healthPercent.toFixed(1) + "%" : "—" }
+                  DetailRow { label: "Condition"; value: root.healthGrade !== "" ? root.healthGrade : "—" }
+                  DetailRow { label: "Wear"; value: Model.formatEnergy(Model.wear(root.statsInfo.energy_full, root.statsInfo.energy_full_design), root.energyUnit) }
+                  DetailRow { label: "Cycle count"; value: Model.formatCount(root.statsInfo.cycle_count) }
+                  DetailRow { label: "Kernel health"; value: root.statsInfo.health || "—" }
+                  DetailRow { label: "Capacity level"; value: root.statsInfo.capacity_level || "—"; showDivider: false }
+                }
+
+                Column {
+                  id: detailPower
+                  anchors.fill: parent
+                  visible: root.detailTab === 1
+                  spacing: 0
+
+                  DetailRow { label: "Energy now"; value: Model.formatEnergy(root.statsInfo.energy_now, root.energyUnit) }
+                  DetailRow { label: "Charge rate"; value: Model.formatWatts(root.statsInfo.power_now) }
+                  DetailRow { label: "Current"; value: Model.formatAmps(root.statsInfo.current_now) }
+                  DetailRow { label: "Voltage"; value: Model.formatVolts(root.statsInfo.voltage_now) }
+                  DetailRow { label: "Temperature"; value: Model.formatCelsius(root.statsInfo.temp_c) }
+                  DetailRow { label: "Time left"; value: root.timeRemainingText !== "" ? root.timeRemainingText : "—"; showDivider: false }
+                }
+
+                Column {
+                  id: detailSpecs
+                  anchors.fill: parent
+                  visible: root.detailTab === 2
+                  spacing: 0
+
+                  DetailRow { label: "Vendor / model"; value: Model.deviceName(root.statsInfo.manufacturer, root.statsInfo.model) }
+                  DetailRow { label: "Cell type"; value: root.statsInfo.technology || "—" }
+                  DetailRow { label: "Serial"; value: root.statsInfo.serial || "—" }
+                  DetailRow { label: "Design capacity"; value: Model.formatEnergy(root.statsInfo.energy_full_design, root.energyUnit) }
+                  DetailRow { label: "Charge threshold"; value: Model.limitModeLabel(root.statsInfo.threshold_start, root.statsInfo.threshold_end) }
+                  DetailRow { label: "sysfs"; value: root.statsInfo.path || "—"; showDivider: false }
+                }
               }
             }
-          }
-
-          GridLayout {
-            width: parent.width
-            columns: 2
-            rowSpacing: Style.space(6)
-            columnSpacing: Style.space(6)
-
-            MetricTile {
-              Layout.fillWidth: true
-              label: "HEALTH"
-              value: root.healthPercent >= 0 ? root.healthPercent.toFixed(1) + "%" : "—"
-              detail: root.healthGrade || "Good"
-              accentValue: root.healthPercent < 70 ? Commons.Color.urgent : root.bar.foreground
-            }
-
-            MetricTile {
-              Layout.fillWidth: true
-              label: "CYCLES"
-              value: Model.formatCount(root.statsInfo.cycle_count)
-              detail: root.batteryInfo.size || Model.formatEnergy(root.statsInfo.energy_full, root.energyUnit)
-            }
-
-            MetricTile {
-              Layout.fillWidth: true
-              label: root.discharging ? "DRAIN" : "FLOW"
-              value: Model.formatWatts(root.statsInfo.power_now)
-              detail: root.acOnline ? "AC Online" : (root.batteryInfo.time || "Discharging")
-            }
-
-            MetricTile {
-              Layout.fillWidth: true
-              label: "TEMP / VOLTS"
-              value: root.statsInfo.temp_c !== undefined ? Model.formatCelsius(root.statsInfo.temp_c) : Model.formatVolts(root.statsInfo.voltage_now)
-              detail: Model.formatVolts(root.statsInfo.voltage_now)
-            }
-          }
-
-          // Extended hardware specs disclosure
-          Column {
-            visible: root.showHardwareDetails
-            width: parent.width
-            spacing: Style.space(4)
-
-            InfoPair { label: "Design Capacity"; value: Model.formatEnergy(root.statsInfo.energy_full_design, root.energyUnit) }
-            InfoPair { label: "Cell Type"; value: root.statsInfo.technology || "Li-poly" }
-            InfoPair { label: "Vendor / Model"; value: (root.statsInfo.manufacturer || "OEM") + " " + (root.statsInfo.model || "") }
-            InfoPair { label: "Voltage Min"; value: Model.formatVolts(root.statsInfo.voltage_min_design) }
           }
         }
 
@@ -993,32 +1031,13 @@ Panel {
             fontFamily: root.bar.fontFamily
           }
 
-          Rectangle {
-            width: parent.width
-            height: Style.space(34)
-            radius: Style.cornerRadius > 0 ? Math.min(8, Style.cornerRadius) : 6
-            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.03)
-            border.width: 1
-            border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
-
+          OptionRow {
+            label: "Percentage inside battery"
             Row {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              spacing: Style.space(8)
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                textFormat: Text.PlainText
-                text: "Show percentage on bar"
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                width: parent.width - toggleSwitch.width - Style.space(8)
-              }
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
 
               ToggleSwitch {
-                id: toggleSwitch
                 anchors.verticalCenter: parent.verticalCenter
                 checked: root.showPercentage
                 foreground: root.bar.foreground
@@ -1028,45 +1047,73 @@ Panel {
             }
           }
 
-          Rectangle {
-            width: parent.width
-            height: Style.space(34)
-            radius: Style.cornerRadius > 0 ? Math.min(8, Style.cornerRadius) : 6
-            color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.03)
-            border.width: 1
-            border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
-
+          OptionRow {
+            label: "iOS 27 borderless body"
             Row {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(10)
-              spacing: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
 
-              Text {
+              ToggleSwitch {
                 anchors.verticalCenter: parent.verticalCenter
-                textFormat: Text.PlainText
-                text: "Auto power-saver at " + root.powerSaverThreshold + "%"
-                color: root.bar.foreground
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                width: parent.width - saverCycleBtn.width - Style.space(8)
+                checked: root.borderlessStyle
+                foreground: root.bar.foreground
+                accent: Commons.Color.accent
+                onToggled: root.updateSetting("borderless", !root.borderlessStyle)
               }
+            }
+          }
+
+          OptionRow {
+            label: "Icon height"
+            Row {
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
 
               Button {
-                id: saverCycleBtn
                 anchors.verticalCenter: parent.verticalCenter
-                text: root.autoSaverEngaged ? "Active" : (root.powerSaverThreshold + "%")
+                text: root.barIconHeight + "px"
                 fontSize: Style.font.caption
-                foreground: root.autoSaverEngaged ? Commons.Color.urgent : root.bar.foreground
+                foreground: root.bar.foreground
                 fontFamily: root.bar.fontFamily
                 horizontalPadding: Style.space(8)
                 verticalPadding: Style.space(2)
                 bordered: true
-                active: root.autoSaverEngaged
-                onClicked: {
-                  var next = root.powerSaverThreshold === 50 ? 30 : (root.powerSaverThreshold === 30 ? 20 : 50)
-                  root.updateSetting("powerSaverThreshold", next)
-                }
+                onClicked: root.updateSetting("iconSize", Model.cycleSetting("iconSize", root.barIconHeight))
+              }
+            }
+          }
+
+          OptionRow {
+            label: "Turn red below"
+            Row {
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+
+              NumberField {
+                anchors.verticalCenter: parent.verticalCenter
+                settingKey: "redThreshold"
+                value: root.redBatteryThreshold
+                minimum: Model.settingRange("redThreshold").min
+                maximum: Model.settingRange("redThreshold").max
+                onCommitted: function(next) { root.updateSetting("redThreshold", next) }
+              }
+            }
+          }
+
+          OptionRow {
+            label: "Auto power-saver at"
+            Row {
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+
+              NumberField {
+                anchors.verticalCenter: parent.verticalCenter
+                settingKey: "powerSaverThreshold"
+                value: root.powerSaverThreshold
+                minimum: Model.settingRange("powerSaverThreshold").min
+                maximum: Model.settingRange("powerSaverThreshold").max
+                alert: root.autoSaverEngaged
+                onCommitted: function(next) { root.updateSetting("powerSaverThreshold", next) }
               }
             }
           }
@@ -1075,76 +1122,242 @@ Panel {
     }
   }
 
-  component MetricTile: Rectangle {
+  // One settings row: a label on the left, whatever control is declared
+  // inside on the right.
+  component OptionRow: Rectangle {
     property string label: ""
-    property string value: ""
-    property string detail: ""
-    property color accentValue: root.bar.foreground
+    default property alias controls: controlSlot.data
 
-    height: Style.space(52)
+    width: parent ? parent.width : 0
+    height: Style.space(34)
     radius: Style.cornerRadius > 0 ? Math.min(8, Style.cornerRadius) : 6
-    color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.04)
+    color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.03)
     border.width: 1
     border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
 
-    Column {
+    Text {
+      id: optionLabel
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Math.max(0, parent.width - controlSlot.width - Style.space(22))
+      textFormat: Text.PlainText
+      text: parent.label
+      color: root.bar.foreground
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
+    }
+
+    // Controls arrive as a Row written by the caller, so a row can hold one
+    // chip or several; this slot only pins that Row to the right edge.
+    Item {
+      id: controlSlot
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(10)
+      // Width comes from the controls; the height is the row's, so a child
+      // centring itself on this item cannot feed back into its size.
+      width: childrenRect.width
+    }
+  }
+
+  // Direct numeric entry for a bounded setting. The validator only admits
+  // integers inside the manifest range, Enter or leaving the field commits,
+  // and unparseable text falls back to the live value instead of writing NaN.
+  component NumberField: Rectangle {
+    id: numberField
+    property string settingKey: ""
+    property int value: 0
+    property int minimum: 0
+    property int maximum: 100
+    property bool alert: false
+    signal committed(int value)
+
+    readonly property color textColor: alert ? Commons.Color.urgent : root.bar.foreground
+
+    implicitWidth: Style.space(40)
+    implicitHeight: Style.space(22)
+    radius: Style.cornerRadius > 0 ? Math.min(8, Style.cornerRadius) : 6
+    color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.06)
+    border.width: 1
+    border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b,
+      input.activeFocus ? 0.35 : 0.12)
+
+    // Set while abandoning an edit: the blur that closing causes must not
+    // commit, so Escape can never write the value it was meant to discard.
+    property bool reverting: false
+    property int focusValue: value
+
+    function commit() {
+      if (reverting) return
+      var next = Model.clampSetting(settingKey, input.text, value)
+      input.text = String(next)
+      // Keep the value selected after a commit so the next keystroke replaces
+      // it instead of appending to digits the user has already accepted.
+      if (input.activeFocus) input.selectAll()
+      if (next !== value) numberField.committed(next)
+    }
+
+    function cancel() {
+      reverting = true
+      input.text = String(focusValue)
+      root.close()
+    }
+
+    Row {
+      anchors.centerIn: parent
+      spacing: Style.space(1)
+
+      TextInput {
+        id: input
+        anchors.verticalCenter: parent.verticalCenter
+        width: Style.space(18)
+        text: String(numberField.value)
+        horizontalAlignment: TextInput.AlignHCenter
+        color: numberField.textColor
+        selectionColor: Commons.Color.accent
+        selectedTextColor: Commons.Color.background
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+        selectByMouse: true
+        validator: IntValidator { bottom: numberField.minimum; top: numberField.maximum }
+        inputMethodHints: Qt.ImhDigitsOnly
+        // Return commits even when the typed value is outside the range, so
+        // the clamp is visible immediately instead of waiting for a blur.
+        Keys.onReturnPressed: { numberField.commit(); root.releaseFieldFocus() }
+        Keys.onEnterPressed: { numberField.commit(); root.releaseFieldFocus() }
+        Keys.onEscapePressed: numberField.cancel()
+        onEditingFinished: numberField.commit()
+        onActiveFocusChanged: {
+          if (activeFocus) {
+            numberField.focusValue = numberField.value
+            numberField.reverting = false
+            selectAll()
+          } else {
+            numberField.commit()
+          }
+        }
+      }
+
+      Text {
+        anchors.verticalCenter: parent.verticalCenter
+        text: "%"
+        textFormat: Text.PlainText
+        color: numberField.textColor
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
+
+    onValueChanged: if (!input.activeFocus) input.text = String(value)
+  }
+
+  // iOS-style segmented control: one gray track, one raised pill for the
+  // selected tab, three equal segments so the card height never changes.
+  component DetailTabs: Rectangle {
+    id: tabs
+    property int current: 0
+    signal selected(int index)
+
+    // UIKit's inset segmented control: 32 pt tall with an 8 pt corner at a
+    // 17 pt body size, scaled to this card's 10 px caption (0.588).
+    implicitHeight: Style.space(19)
+    radius: Style.cornerRadius > 0 ? Math.min(5, Style.cornerRadius) : 5
+    color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.06)
+
+    Row {
       anchors.fill: parent
-      anchors.margins: Style.space(6)
+      anchors.margins: Style.space(2)
       spacing: Style.space(2)
 
-      Text {
-        textFormat: Text.PlainText
-        text: label
-        color: Qt.darker(root.bar.foreground, 1.45)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption - 1
-        font.bold: true
-        font.letterSpacing: 0.5
-      }
+      Repeater {
+        model: ["HEALTH", "POWER", "SPECS"]
 
-      Text {
-        textFormat: Text.PlainText
-        text: value
-        color: accentValue
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.body
-        font.bold: true
-      }
+        Rectangle {
+          required property int index
+          required property string modelData
 
-      Text {
-        textFormat: Text.PlainText
-        text: detail
-        color: Qt.darker(root.bar.foreground, 1.3)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption - 1
-        elide: Text.ElideRight
-        width: parent.width
+          width: (tabs.width - Style.space(8)) / 3
+          height: parent.height
+          radius: Style.cornerRadius > 0 ? Math.min(5, Style.cornerRadius) : 5
+          color: index === tabs.current
+            ? Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.16)
+            : "transparent"
+
+          Text {
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: modelData
+            color: root.bar.foreground
+            opacity: index === tabs.current ? 1 : 0.55
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption - 2
+            font.bold: index === tabs.current
+            font.letterSpacing: 0.6
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: tabs.selected(index)
+          }
+        }
       }
     }
   }
 
-  component InfoPair: Row {
+  // One real row of the detail card: label left, value right, hairline
+  // separator underneath. Fixed height keeps the three tabs interchangeable,
+  // and missing hardware attributes print "—" instead of collapsing a row.
+  component DetailRow: Item {
+    id: row
     property string label: ""
     property string value: ""
+    property bool showDivider: true
 
-    width: parent.width
-    spacing: Style.space(8)
+    width: parent ? parent.width : 0
+    // UITableView's default 44 pt row at this card's 0.588 scale.
+    height: Style.space(26)
 
     Text {
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      width: Math.max(0, parent.width - rowValue.implicitWidth - Style.space(8))
       textFormat: Text.PlainText
+      text: row.label
       color: root.bar.foreground
-      opacity: 0.6
+      opacity: 0.62
       font.family: root.bar.fontFamily
       font.pixelSize: Style.font.caption
-      text: label
+      elide: Text.ElideRight
     }
-    Item { width: Math.max(0, parent.width - parent.children[0].implicitWidth - parent.children[2].implicitWidth - parent.spacing * 2); height: 1 }
+
     Text {
+      id: rowValue
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      width: Math.min(implicitWidth, parent.width * 0.62)
       textFormat: Text.PlainText
+      text: row.value
+      horizontalAlignment: Text.AlignRight
+      elide: Text.ElideLeft
       color: root.bar.foreground
       font.family: root.bar.fontFamily
       font.pixelSize: Style.font.caption
-      text: value
+    }
+
+    Rectangle {
+      visible: row.showDivider
+      // UIKit starts a list separator at the text's leading edge (16 pt at
+      // 17 pt body, 9 pt here), not at the card edge.
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(9)
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      height: 1
+      color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.08)
     }
   }
 }
