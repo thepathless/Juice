@@ -131,6 +131,9 @@ Panel {
   // limit the glyph uses, so the sentence can never contradict the icon.
   readonly property string chargeStateText: Model.stateDetailLabel(
     root.batteryState, root.batteryLevel, root.chargeLimitEnd)
+  // The sentence the card has no room for; the bar tooltip does.
+  readonly property string stateExplanation: Model.stateExplanation(
+    root.batteryState, root.chargeLimitEnd)
 
   function selectProfileByDelta(delta) {
     profileIndex = Model.selectProfileIndex(profileIndex, delta, profiles)
@@ -589,6 +592,7 @@ Panel {
     foreground: root.barIconColor
     tooltipText: root.batteryStateText
       + (root.showPercentage || root.batteryLevel < 0 ? "" : " · " + root.batteryLevel + "%")
+      + (root.stateExplanation === "" ? "" : " · " + root.stateExplanation)
     // BarIconContent scales every iconComponent into Style.bar.iconSize (12px
     // on this shell), which is exactly why the old glyph looked tiny. The empty
     // item keeps the button's "has visual content" true while the real glyph,
@@ -862,6 +866,8 @@ Panel {
             }
           }
 
+          // No elide: every sentence this label can hold is short enough for
+          // the card, so a missing tail would only ever hide a real bug.
           Text {
             textFormat: Text.PlainText
             width: parent.width
@@ -870,7 +876,6 @@ Panel {
             opacity: 0.6
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
           }
 
           Text {
@@ -1013,7 +1018,7 @@ Panel {
                   DetailRow { label: "Serial"; value: root.statsInfo.serial || "—" }
                   DetailRow { label: "Design capacity"; value: Model.formatEnergy(root.statsInfo.energy_full_design, root.energyUnit) }
                   DetailRow { label: "Charge threshold"; value: Model.limitModeLabel(root.statsInfo.threshold_start, root.statsInfo.threshold_end) }
-                  DetailRow { label: "sysfs"; value: root.statsInfo.path || "—"; showDivider: false }
+                  DetailRow { label: "sysfs"; value: Model.pathBase(root.statsInfo.path); showDivider: false }
                 }
               }
             }
@@ -1321,28 +1326,33 @@ Panel {
     // UITableView's default 44 pt row at this card's 0.588 scale.
     height: Style.space(26)
 
+    // The label takes exactly the width its glyphs need and is never elided:
+    // a caption cut to "Charge thresho…" is a defect, not a layout trade-off.
     Text {
+      id: rowLabel
       anchors.left: parent.left
       anchors.verticalCenter: parent.verticalCenter
-      width: Math.max(0, parent.width - rowValue.implicitWidth - Style.space(8))
+      width: implicitWidth
       textFormat: Text.PlainText
       text: row.label
       color: root.bar.foreground
       opacity: 0.62
       font.family: root.bar.fontFamily
       font.pixelSize: Style.font.caption
-      elide: Text.ElideRight
+      elide: Text.ElideNone
     }
 
+    // The value gets the rest of the row and is never elided either; the
+    // strings in the three tabs are short enough to fit that width whole.
     Text {
       id: rowValue
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      width: Math.min(implicitWidth, parent.width * 0.62)
+      width: Math.max(0, parent.width - rowLabel.width - Style.space(8))
       textFormat: Text.PlainText
       text: row.value
       horizontalAlignment: Text.AlignRight
-      elide: Text.ElideLeft
+      elide: Text.ElideNone
       color: root.bar.foreground
       font.family: root.bar.fontFamily
       font.pixelSize: Style.font.caption

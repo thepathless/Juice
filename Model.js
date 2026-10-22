@@ -120,10 +120,18 @@ function stateDetailLabel(state, level, limit) {
   var hasLimit = cap >= 0
   var suffix = hasLimit ? " · limit " + cap + "%" : ""
   if (state === "charging") return "Charging" + suffix
-  if (state === "plugged") return "Holding at the " + cap + "% limit (EC bypasses to AC)"
+  if (state === "plugged") return hasLimit ? "Holding at the " + cap + "% limit" : "Plugged in"
   if (state === "full") return "Fully charged" + suffix
   if (state === "discharging") return "Discharging" + suffix
   return ""
+}
+
+// The long form of the same fact, for the bar tooltip: the card is 290 px and
+// already says the short version, the explanation needs room of its own.
+function stateExplanation(state, limit) {
+  var cap = number(limit)
+  if (state !== "plugged" || cap < 0) return ""
+  return "The embedded controller passes AC through while held at " + cap + "%"
 }
 
 // Which phrase set the hero may rotate: current flowing in, flowing out, or
@@ -393,13 +401,23 @@ function wear(microFull, microDesign) {
 
 // start 0 means "no lower bound" on thinkpad_acpi (kernel docs: 0 = threshold
 // off), so it is shown as "off" rather than as a 0% start.
+// Kept to a card-width value: the row it sits in is 280 px wide, so the long
+// prose versions overflowed the label before they were ever read.
 function limitModeLabel(start, end) {
   var e = number(end)
-  if (e < 0) return "Charge threshold not exposed"
+  if (e < 0) return "Not exposed"
   var s = number(start)
-  if (s > 0 && s !== e) return "Charging between " + s + "% and " + e + "%"
-  if (e >= 100) return "Full charge, stops at 100%"
-  return "Charging capped at " + e + "%"
+  if (s > 0 && s !== e) return s + "–" + e + "%"
+  if (e >= 100) return "Up to 100%"
+  return "Capped at " + e + "%"
+}
+
+// The controller node's basename: a full path is 30 characters of noise in a
+// 280 px row, and "BAT0" is the part anyone recognises.
+function pathBase(path) {
+  var parts = String(path === undefined || path === null ? "" : path).split("/")
+  var last = parts.length > 0 ? parts[parts.length - 1] : ""
+  return last !== "" ? last : "—"
 }
 
 function limitStartLabel(start) {
@@ -425,6 +443,7 @@ if (typeof module !== "undefined") {
     batteryState: batteryState,
     stateLabel: stateLabel,
     stateDetailLabel: stateDetailLabel,
+    stateExplanation: stateExplanation,
     flowKind: flowKind,
     batteryIconForState: batteryIconForState,
     iconColor: iconColor,
@@ -456,6 +475,7 @@ if (typeof module !== "undefined") {
     healthGrade: healthGrade,
     wear: wear,
     limitModeLabel: limitModeLabel,
-    limitStartLabel: limitStartLabel
+    limitStartLabel: limitStartLabel,
+    pathBase: pathBase
   }
 }

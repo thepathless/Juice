@@ -10,15 +10,27 @@ Battery bar widget and compact dashboard panel for [Omarchy](https://omarchy.org
 
 ## Screenshots
 
-![Juice bar glyph while plugged at 81 percent and while charging](docs/screenshots/bar.png)
+Every pixel below is either a 1:1 capture of the running shell or the QML itself rendered at the size shown — nothing is upscaled.
 
-![The Juice panel open on the HEALTH tab](docs/screenshots/panel-health.png)
+### In the bar
 
-The panel's detail card holds three tabs — [POWER](docs/screenshots/panel-power.png) and [SPECS](docs/screenshots/panel-specs.png) — and the glyph reads at every level, charging included:
+![Juice in the real status bar at 1:1, with the plugged and charging glyphs rendered at 52 px](docs/screenshots/bar.png)
 
-![Battery glyph at 25, 50, 75 and 100 percent, then charging](docs/screenshots/glyph-states.png)
+### The panel
 
-Measured against the references: [the icon against SF Symbols](docs/screenshots/icon-vs-sfsymbols.png) and [the detail card against UIKit metrics](docs/screenshots/card-vs-reference.png).
+![The Juice panel open on HEALTH, showing capacity, condition, wear, cycle count and capacity level](docs/screenshots/panel-health.png)
+
+![The Juice panel open on POWER, showing energy now, charge rate, current, voltage, temperature and time left](docs/screenshots/panel-power.png)
+
+![The Juice panel open on SPECS, showing vendor, cell type, serial, design capacity, charge threshold and the sysfs node](docs/screenshots/panel-specs.png)
+
+### Glyph and references
+
+![Battery glyph rendered at 64 px at 25, 50, 75 and 100 percent, then charging at 81 percent](docs/screenshots/glyph-states.png)
+
+![Four SF Symbols battery glyphs beside the Juice glyphs at the same 64 px body height](docs/screenshots/icon-vs-sfsymbols.png)
+
+![The UIKit-derived detail card beside the live card, both at 1:1](docs/screenshots/card-vs-reference.png)
 
 ## Features
 
@@ -169,12 +181,19 @@ current hardware threshold and the saved target file alone.
 Juice/
 ├── manifest.json                               plugin manifest (schemaVersion 1)
 ├── Panel.qml                                   bar widget + panel
-├── Model.js                                    stock helpers + health/limit formatting
+├── BatteryIcon.qml                             vector battery glyph
+├── Model.js                                    state machine and formatting helpers
 ├── scripts/juice-stats                         read-only sysfs probe
 ├── scripts/juice-set-limit                     applies/restores a charge target
 ├── udev/99-juice-charge-thresholds.rules       threshold write access
 ├── systemd/juice-charge-target.service         login restore unit
-├── install.sh / uninstall.sh
+├── tests/icon-geometry                         glyph geometry regression check
+├── docs/screenshots/                           the plates above
+├── install.sh
+├── uninstall.sh
+├── LICENSE
+├── README.md
+└── .gitignore
 ```
 
 ## License
