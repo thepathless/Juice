@@ -37,7 +37,7 @@ day, so it always starts closed on today.
 ## Session actions
 
 Open Juice with `Super+Alt+B` after adding the binding (see
-[Usage](#usage)). The tiles show a letter and a number; hold either for **ten
+[Usage](#usage)). The tiles show a letter and a number; hold either for **three
 seconds** to run the action. The tile fills, counts down, and resets the moment
 you release early. The mouse uses the same gesture: press and hold a tile.
 
